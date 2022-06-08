@@ -1,0 +1,47 @@
+void RAIDController::doRead(RequestContext *ctx)
+{
+  uint64_t slba = ctx->lba;
+  int size = ctx->size;
+  void *data = ctx->data;
+  printf("Context %p is allocated to user!\n", ctx);
+
+  std::vector<std::pair<uint64_t, PhysicalAddr>> validLbas;
+  for (uint32_t pos = 0; pos < size; pos += gBlockSize) {
+    uint64_t lba = slba + pos;
+    uint8_t *block = (uint8_t*)data + pos;
+    bool success = false;
+
+    PhysicalAddr phyAddr;
+    if (!lookupIndex(lba, &phyAddr)) {
+      memset(block, 0, gBlockSize);
+      ctx->successBytes += gBlockSize;
+      if (ctx->successBytes == ctx->targetBytes) {
+        ctx->Queue();
+      }
+    } else {
+      validLbas.emplace_back(std::make_pair(lba, phyAddr));
+    }
+  }
+
+  for (auto pr : validLbas) {
+    uint64_t lba = pr.first;
+    PhysicalAddr phyAddr = pr.second;
+    ZoneGroup *zoneGroup = phyAddr.zoneGroup;
+
+    TryReadFromZoneGroupArgs args;
+    args.requestContext = ctx;
+    args.pos = lba - slba;
+    args.phyAddr = phyAddr;
+    args.ready = false;
+    args.success = false;
+
+    while (!args.success) {
+      args.ready = false;
+      spdk_thread_send_msg(mDispatchThread,
+          tryReadFromZoneGroup,
+          &args);
+      busyWait(&args.ready);
+    }
+  }
+}
+
