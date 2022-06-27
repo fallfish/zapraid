@@ -26,7 +26,6 @@ private:
   Device* mDevice;
   uint64_t mSlba; // in blocks
   uint32_t mLength; // in blocks
-  uint32_t mNumInvalidBlocks;
   uint32_t mPos; // in blocks
 };
 #endif

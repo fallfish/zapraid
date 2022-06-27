@@ -3,7 +3,7 @@
 #include <queue>
 #include "common.h"
 #include "device.h"
-#include "zone_group.h"
+#include "segment.h"
 #include "spdk/thread.h"
 #include "raid_controller.h"
 #include <sys/time.h>
@@ -79,17 +79,42 @@ void handleGcContext(RequestContext *context, std::vector<RequestContext*> &need
   context->available = true;
 }
 
+void handleIndexContext(RequestContext *context, std::vector<RequestContext*> &needCheck)
+{
+  ContextStatus &status = context->status;
+  if (status == WRITE_REAPING) {
+    status = WRITE_COMPLETE;
+  } else if (status == READ_REAPING) {
+    status = READ_COMPLETE;
+  } else {
+    assert(0);
+  }
+  context->available = true;
+}
+
+
 static void handleStripeUnitContext(RequestContext *context, std::vector<RequestContext*> &needCheck)
 {
-  context->zoneGroup->Assert();
   ContextStatus &status = context->status;
   switch (status) {
     case WRITE_REAPING:
       if (context->successBytes == context->targetBytes) {
         if (context->append) {
-          context->zoneGroup->UpdateSyncPoint(context->zoneId,
+          context->segment->UpdateSyncPoint(context->zoneId,
               context->stripeId,
               context->offset);
+        }
+
+        if (Configuration::GetStripePersistencyMode() == 0) {
+          RequestContext *parent = context->associatedRequest;
+          if (parent) {
+            parent->pbaArray[(context->lba - parent->lba) / Configuration::GetBlockSize()] = context->GetPba();
+            parent->successBytes += context->targetBytes;
+            if (contextReady(parent)) {
+              needCheck.emplace_back(parent);
+            }
+            assert(parent->successBytes <= parent->targetBytes);
+          }
         }
 
         if (context->associatedStripe) {
@@ -97,21 +122,23 @@ static void handleStripeUnitContext(RequestContext *context, std::vector<Request
           if (context->associatedStripe->successBytes == context->associatedStripe->targetBytes) {
             // stripe finish, notify the corresponding user request
             for (auto contextInStripe : context->associatedStripe->ioContext) {
-              RequestContext *parent = contextInStripe->associatedRequest;
-              if (parent) {
-                parent->pbaArray[(contextInStripe->lba - parent->lba) / Configuration::GetBlockSize()] = contextInStripe->GetPba();
-                parent->successBytes += contextInStripe->targetBytes;
-                if (contextReady(parent)) {
-                  needCheck.emplace_back(parent);
-//                  printf("Context %p bring back its parent %p!\n", context, parent);
+              if (Configuration::GetStripePersistencyMode() == 1) {
+                RequestContext *parent = contextInStripe->associatedRequest;
+                if (parent) {
+                  parent->pbaArray[(contextInStripe->lba - parent->lba) / Configuration::GetBlockSize()] = contextInStripe->GetPba();
+                  parent->successBytes += contextInStripe->targetBytes;
+                  if (contextReady(parent)) {
+                    needCheck.emplace_back(parent);
+                    //                  printf("Context %p bring back its parent %p!\n", context, parent);
+                  }
+                  assert(parent->successBytes <= parent->targetBytes);
                 }
-                assert(parent->successBytes <= parent->targetBytes);
               }
             }
           }
         }
 
-        context->zoneGroup->WriteComplete(context);
+        context->segment->WriteComplete(context);
         status = WRITE_COMPLETE;
         context->available = true;
       }
@@ -119,19 +146,18 @@ static void handleStripeUnitContext(RequestContext *context, std::vector<Request
     case READ_REAPING:
     case DEGRADED_READ_REAPING:
       if (context->needDegradedRead) {
-        assert(status != READ_REAPING);
         context->needDegradedRead = false;
         SystemMode mode = Configuration::GetSystemMode();
-        if (mode == ZONE_APPEND_WITH_META || mode == ZONE_APPEND_WITH_REDIRECTION) {
+        if (mode == ZNS_RAID_WITH_META || mode == ZNS_RAID_WITH_REDIRECTION) {
           status = DEGRADED_READ_META;
-          context->zoneGroup->ReadStripeMeta(context);
+          context->segment->ReadStripeMeta(context);
         } else {
           status = DEGRADED_READ_REAPING;
-          context->zoneGroup->ReadStripe(context);
+          context->segment->ReadStripe(context);
         }
       } else if (context->successBytes == context->targetBytes) {
-        context->zoneGroup->ReadComplete(context);
-        context->associatedRequest->successBytes += context->targetBytes;
+        context->segment->ReadComplete(context);
+        context->associatedRequest->successBytes += Configuration::GetBlockSize();
         if (contextReady(context->associatedRequest)) {
           needCheck.emplace_back(context->associatedRequest);
 //          printf("Context %p bring back its parent %p!\n", context, context->associatedRequest);
@@ -145,6 +171,8 @@ static void handleStripeUnitContext(RequestContext *context, std::vector<Request
     case DEGRADED_READ_SUB:
       assert(context->associatedRequest);
       context->associatedRequest->successBytes += context->targetBytes;
+      context->segment->ReadComplete(context);
+      
       if (contextReady(context->associatedRequest)) {
         needCheck.emplace_back(context->associatedRequest);
       }
@@ -152,14 +180,26 @@ static void handleStripeUnitContext(RequestContext *context, std::vector<Request
     case DEGRADED_READ_META:
       if (contextReady(context)) {
         status = DEGRADED_READ_REAPING;
-        context->zoneGroup->ReadStripe(context);
+        context->segment->ReadStripe(context);
       }
+      break;
+    case RESET_REAPING:
+      context->associatedRequest->targetBytes += 1;
+      status = RESET_COMPLETE;
+      if (contextReady(context->associatedRequest)) {
+        needCheck.emplace_back(context->associatedRequest);
+      }
+      context->available = true;
+      break;
+    case FINISH_REAPING:
+      status = FINISH_COMPLETE;
+      context->available = true;
       break;
     default:
       printf("Error in context handling!\n");
+      assert(0);
       exit(-1);
   }
-  context->zoneGroup->Assert();
 }
 
 void handleContext(RequestContext *context, std::vector<RequestContext*> &needCheck)
@@ -171,7 +211,27 @@ void handleContext(RequestContext *context, std::vector<RequestContext*> &needCh
     handleStripeUnitContext(context, needCheck);
   } else if (type == GC) {
     handleGcContext(context, needCheck);
+  } else if (type == INDEX) {
+    handleIndexContext(context, needCheck);
   }
+}
+
+void handlEventsCompletionsOneEvent(void *args)
+{
+  RequestContext *req = (RequestContext*)args;
+  std::vector<RequestContext *> needCheck, needEnqueue;
+  handleContext(req, needEnqueue);
+
+//  RAIDController *ctrl = req->ctrl;
+//  std::queue<RequestContext*>& q = ctrl->GetRequestQueue();
+//  std::mutex& qMutex = ctrl->GetRequestQueueMutex();
+//
+//  qMutex.lock();
+  for (RequestContext *req : needEnqueue) {
+    handleContext(req, needCheck);
+//    q.push(req, needCheck);
+  }
+//  qMutex.unlock();
 }
 
 int handleEventsCompletion(void *args)
@@ -232,9 +292,11 @@ int handleEventsDispatch(void *args)
   return eventsToDispatch.size() > 0 ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
 }
 
-int scheduleGc(void *args) {
+int handleBackgroundTasks(void *args) {
   RAIDController *raidController = (RAIDController*)args;
-  bool hasProgress = raidController->ProceedGc();
+  bool hasProgress = false;
+//  bool hasProgress = raidController->ProceedGc();
+  hasProgress |= raidController->CheckSegments();
 
   return hasProgress ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
 }
@@ -245,8 +307,8 @@ int dispatchWorker(void *args)
   struct spdk_thread *thread = raidController->GetDispatchThread();
   spdk_set_thread(thread);
   spdk_poller_register(handleEventsCompletion, raidController, 0);
-  spdk_poller_register(handleEventsDispatch, raidController, 0);
-//  spdk_poller_register(scheduleGc, raidController, 0);
+  spdk_poller_register(handleEventsDispatch, raidController, 1);
+  spdk_poller_register(handleBackgroundTasks, raidController, 20);
   while (true) {
     spdk_thread_poll(thread, 0, 0);
   }

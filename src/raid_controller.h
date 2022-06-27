@@ -6,10 +6,11 @@
 #include <map>
 #include "common.h"
 #include "device.h"
-#include "zone_group.h"
+#include "segment.h"
+#include "persistent_metadata.h"
 #include "spdk/thread.h"
 
-class ZoneGroup;
+class Segment;
 
 class RAIDController {
 public:
@@ -30,6 +31,7 @@ public:
   int GetNumInflightRequests();
   bool ProceedGc();
   bool ExistsGc();
+  bool CheckSegments();
 
   void WriteInDispatchThread(RequestContext *ctx);
   void ReadInDispatchThread(RequestContext *ctx);
@@ -56,8 +58,8 @@ private:
 
   bool lookupIndex(uint64_t lba, PhysicalAddr *phyAddr);
 
-  void createZoneGroupIfNeeded(ZoneGroup **zoneGroup);
-  void sealZoneGroupIfNeeded(ZoneGroup **zoneGroup);
+  void createSegmentIfNeeded(Segment **segment);
+  void sealSegmentIfNeeded(Segment **segment);
   bool scheduleGc();
 
   void initializeGcTask();
@@ -68,10 +70,12 @@ private:
 
   std::vector<Device*> mDevices;
   std::map<LogicalAddr, PhysicalAddr> *mAddressMap;
-  std::vector<ZoneGroup*> mSealedZoneGroups;
-  std::vector<ZoneGroup*> mOpenZoneGroups;
+  std::vector<Segment*> mSealedSegments;
+  std::vector<Segment*> mSegmentsToSeal;
+  std::vector<Segment*> mOpenSegments;
+  Segment* mSpareSegment;
 
-  uint32_t mNumRequestContext = 32;
+  uint32_t mNumRequestContext = 64;
   RequestContext *mRequestContextPool;
   std::vector<RequestContext*> mAvailableRequestContext;
   std::vector<RequestContext*> mInflightRequestContext;
@@ -83,19 +87,24 @@ private:
 
   struct GcTask mGcTask;
 
-  uint32_t mNumOpenZoneGroups = 1;
+  uint32_t mNumOpenSegments = 1;
 
   IoThread mIoThread[16];
   struct spdk_thread *mDispatchThread;
 
-  uint64_t mNumInvalidBlocks = 0;
-  uint64_t mNumBlocks = 0;
+  int64_t mNumInvalidBlocks = 0;
+  int64_t mNumBlocks = 0;
   struct spdk_thread *mControllerThread;
 
   std::vector<RequestContext*> mEventsToDispatch;
 
   uint32_t mNumAvailableZones = 0;
   uint32_t mNumTotalZones = 0;
+
+  uint32_t mNextAssignedSegmentId = 0;
+  uint32_t mGlobalTimestamp = 0;
+
+  PersistentMetadata *mPersistentMetadata;
 };
 
 #endif

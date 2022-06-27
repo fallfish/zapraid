@@ -7,102 +7,25 @@
 #include <vector>
 #include <map>
 #include "spdk/nvme.h"
+#include "configuration.h"
 
-class ZoneGroup;
+class Segment;
 class RAIDController;
 struct RequestContext;
 struct GcTask;
-
-enum SystemMode {
-  PURE_WRITE, PURE_ZONE_APPEND,
-  ZONE_APPEND_NO_META, ZONE_APPEND_WITH_META,
-  ZONE_APPEND_WITH_REDIRECTION
-};
-
-class Configuration {
-public:
-  static Configuration& GetInstance() {
-    static Configuration instance;
-    return instance;
-  }
-
-  static int GetStripeSize() {
-    return GetInstance().gStripeSize;
-  }
-
-  static int GetStripeDataSize() {
-    return GetInstance().gStripeDataSize;
-  }
-
-  static int GetStripeParitySize() {
-    return GetInstance().gStripeParitySize;
-  }
-
-  static int GetStripeUnitSize() {
-    return GetInstance().gStripeUnitSize;
-  }
-
-  static int GetBlockSize() {
-    return GetInstance().gBlockSize;
-  }
-
-  static int GetMetadataSize() {
-    return GetInstance().gMetadataSize;
-  }
-
-  static int GetNumIoThreads() {
-    return GetInstance().gNumIoThreads;
-  }
-
-  static bool GetDeviceSupportMetadata() {
-    return GetInstance().gDeviceSupportMetadata;
-  }
-
-  static int GetZoneCapacity() {
-    return GetInstance().gZoneCapacity;
-  }
-
-  static void SetZoneCapacity(int cap) {
-    GetInstance().gZoneCapacity = cap;
-  }
-
-  static SystemMode GetSystemMode() {
-    return GetInstance().gSystemMode;
-  }
-
-  static void SetSystemMode(SystemMode mode) {
-    GetInstance().gSystemMode = mode;
-  }
-
-private:
-  int gStripeSize = 4096 * 3;
-  int gStripeDataSize = 4096 * 2;
-  int gStripeParitySize = 4096 * 1;
-  int gStripeUnitSize = 4096 * 1;
-  int gStripeBlockSize = 4096;
-  int gBlockSize = 4096;
-  int gMetadataSize = 64;
-  int gNumIoThreads = 3;
-  bool gDeviceSupportMetadata = false;
-  int gZoneCapacity = 0;
-
-  SystemMode gSystemMode = PURE_WRITE;
-  // 0: Pure write; 1: Pure zone append; 2: Zone append without metadata; 3: Zone append with metadata; 4: Zone append with redirection
-
-};
 
 typedef void (*zns_raid_request_complete)(void *cb_arg);
 
 typedef uint64_t LogicalAddr;
 struct PhysicalAddr {
-  ZoneGroup* zoneGroup;
+  Segment* segment;
   uint32_t zoneId;
   uint32_t stripeId;
   uint32_t offset;
   void PrintOffset();
 
   bool operator==(const PhysicalAddr o) const {
-    return (zoneGroup == o.zoneGroup) &&
+    return (segment == o.segment) &&
            (zoneId == o.zoneId) &&
            (offset == o.offset);
   }
@@ -122,25 +45,32 @@ enum ContextStatus {
   DEGRADED_READ_REAPING,
   DEGRADED_READ_META,
   DEGRADED_READ_SUB,
+  RESET_REAPING,
+  RESET_COMPLETE,
+  FINISH_REAPING,
+  FINISH_COMPLETE
 };
 
 enum ContextType
 {
   USER,
   GC,
+  INDEX,
   STRIPE_UNIT,
 };
 
 struct StripeWriteContext {
-  uint8_t *data;
+  uint8_t **data;
   uint8_t *metadata;
+  uint8_t *dataPool;
   std::vector<RequestContext*> ioContext;
   uint32_t targetBytes;
   uint32_t successBytes;
 };
 
 struct ReadContext {
-  uint8_t *data;
+  uint8_t **data;
+  uint8_t *dataPool;
   uint8_t *metadata;
   std::vector<RequestContext*> ioContext;
 };
@@ -148,13 +78,16 @@ struct ReadContext {
 union BlockMetadata {
   struct {
     uint64_t lba;
-    uint8_t stripeId;
+    uint64_t timestamp;
+    uint8_t  stripeId;
   } d;
   uint8_t reserved[64];
 };
 
 struct RequestContext
 {
+  // Each Context is pre-allocated with a buffer
+  uint8_t *buffer;
   ContextType type;
   ContextStatus status;
 
@@ -164,9 +97,8 @@ struct RequestContext
   uint64_t lba;
   uint32_t size;
   uint8_t  req_type;
-  void *data;
-  void *meta;
-  std::vector<PhysicalAddr> pbaArray;
+  uint8_t *data;
+  uint8_t *meta;
   uint32_t successBytes;
   uint32_t targetBytes;
   uint32_t curOffset;
@@ -175,9 +107,9 @@ struct RequestContext
 
   bool available;
 
-  // Used inside a ZoneGroup write/read
+  // Used inside a Segment write/read
   RAIDController *ctrl;
-  ZoneGroup *zoneGroup;
+  Segment *segment;
   uint32_t zoneId;
   uint32_t stripeId;
   uint32_t offset;
@@ -185,6 +117,7 @@ struct RequestContext
 
   double stime;
   double ctime;
+  uint64_t timestamp;
 
   // context during request process
   RequestContext* associatedRequest;
@@ -207,6 +140,7 @@ struct RequestContext
   } ioContext;
 
   GcTask *gcTask;
+  std::vector<PhysicalAddr> pbaArray;
 
   void Clear();
   void Queue();
@@ -220,7 +154,7 @@ struct RequestContext
 struct SyncPoint {
   uint8_t *data;
   uint8_t *metadata;
-  RequestContext slots[3];
+  RequestContext slots[16];
 };
 
 enum GcTaskStage {
@@ -233,8 +167,8 @@ enum GcTaskStage {
 struct GcTask {
   GcTaskStage stage;
 
-  ZoneGroup *inputZoneGroup;
-  ZoneGroup *outputZoneGroup;
+  Segment *inputSegment;
+  Segment *outputSegment;
   uint32_t maxZoneId;
   uint32_t maxOffset;
 
@@ -262,5 +196,6 @@ struct IoThread {
 };
 
 double timestamp();
+static void b() {}
 
 #endif

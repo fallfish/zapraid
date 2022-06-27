@@ -1,12 +1,12 @@
 #include "common.h"
-#include "zone_group.h"
+#include "segment.h"
 #include "raid_controller.h"
 #include <sys/time.h>
 #include <queue>
 
 void PhysicalAddr::PrintOffset() {
-  uint32_t deviceId = zoneGroup->GetZones()[zoneId]->GetDeviceId();
-  uint32_t pba = zoneGroup->GetZones()[zoneId]->GetSlba();
+  uint32_t deviceId = segment->GetZones()[zoneId]->GetDeviceId();
+  uint32_t pba = segment->GetZones()[zoneId]->GetSlba();
   printf("phyAddr: deviceId: %u, stripeId: %u, pba: %u\n",
          deviceId, stripeId, pba + offset);
 }
@@ -21,13 +21,15 @@ void RequestContext::Clear()
   cb_args = nullptr;
   curOffset = 0;
 
+  timestamp = ~0ull;
+
   append = false;
 
   associatedRequest = nullptr;
   associatedStripe = nullptr;
   associatedRead = nullptr;
   ctrl = nullptr;
-  zoneGroup = nullptr;
+  segment = nullptr;
 
   needDegradedRead = false;
   pbaArray.clear();
@@ -42,7 +44,7 @@ double RequestContext::GetElapsedTime()
 PhysicalAddr RequestContext::GetPba()
 {
   PhysicalAddr addr;
-  addr.zoneGroup = zoneGroup;
+  addr.segment = segment;
   addr.zoneId = zoneId;
   addr.stripeId = stripeId;
   addr.offset = offset;
@@ -89,7 +91,7 @@ void RequestContext::CopyFrom(const RequestContext &o) {
   available = o.available;
   
   ctrl = o.ctrl;
-  zoneGroup = o.zoneGroup;
+  segment = o.segment;
   zoneId = o.zoneId;
   stripeId = o.stripeId;
   offset = o.offset;

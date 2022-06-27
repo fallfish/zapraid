@@ -4,15 +4,15 @@
 !_TAG_PROGRAM_NAME	Exuberant Ctags	//
 !_TAG_PROGRAM_URL	http://ctags.sourceforge.net	/official site/
 !_TAG_PROGRAM_VERSION	5.9~svn20110310	//
-AddZone	zone_group.cc	/^void ZoneGroup::AddZone(Zone *zone)$/;"	f	class:ZoneGroup
+AddZone	zone_group.cc	/^void Segment::AddZone(Zone *zone)$/;"	f	class:Segment
 AdvancePos	zone.cc	/^void Zone::AdvancePos()$/;"	f	class:Zone
 Append	device.cc	/^void Device::Append(uint64_t offset, uint32_t size, void* data, void *metadata, void* ctx)$/;"	f	class:Device
-Append	zone_group.cc	/^PhysicalAddr ZoneGroup::Append(RequestContext *ctx, uint32_t offset)$/;"	f	class:ZoneGroup
+Append	zone_group.cc	/^PhysicalAddr Segment::Append(RequestContext *ctx, uint32_t offset)$/;"	f	class:Segment
 Clear	common.cc	/^void RequestContext::Clear()$/;"	f	class:RequestContext
 ConnectIoPairs	device.cc	/^void Device::ConnectIoPairs()$/;"	f	class:Device
 Device	device.h	/^class Device {$/;"	c
 Drain	raid_controller.cc	/^void RAIDController::Drain()$/;"	f	class:RAIDController
-Drain	zone_group.cc	/^void ZoneGroup::Drain()$/;"	f	class:ZoneGroup
+Drain	zone_group.cc	/^void Segment::Drain()$/;"	f	class:Segment
 FinishBytes	common.cc	/^void RequestContext::FinishBytes(uint32_t bytes)$/;"	f	class:RequestContext
 GetAssignedPba	common.cc	/^PhysicalAddr RequestContext::GetAssignedPba()$/;"	f	class:RequestContext
 GetController	device.h	/^  struct spdk_nvme_ctrlr* GetController() { return mController; }$/;"	f	class:Device
@@ -24,14 +24,14 @@ GetIoQueues	device.h	/^  struct spdk_nvme_qpair** GetIoQueues() { return mIoQueu
 GetLba	common.cc	/^uint64_t RequestContext::GetLba()$/;"	f	class:RequestContext
 GetLength	zone.cc	/^uint32_t Zone::GetLength()$/;"	f	class:Zone
 GetNamespace	device.h	/^  struct spdk_nvme_ns* GetNamespace() { return mNamespace; }$/;"	f	class:Device
-GetNumBlocks	zone_group.cc	/^uint64_t ZoneGroup::GetNumBlocks() const$/;"	f	class:ZoneGroup
-GetNumInvalidBlocks	zone_group.cc	/^uint64_t ZoneGroup::GetNumInvalidBlocks() const$/;"	f	class:ZoneGroup
+GetNumBlocks	zone_group.cc	/^uint64_t Segment::GetNumBlocks() const$/;"	f	class:Segment
+GetNumInvalidBlocks	zone_group.cc	/^uint64_t Segment::GetNumInvalidBlocks() const$/;"	f	class:Segment
 GetOp	common.cc	/^Request* RequestContext::GetOp()$/;"	f	class:RequestContext
 GetPollGroup	raid_controller.cc	/^struct spdk_nvme_poll_group* RAIDController::GetPollGroup()$/;"	f	class:RAIDController
 GetPos	zone.cc	/^uint32_t Zone::GetPos()$/;"	f	class:Zone
 GetRealPba	common.cc	/^PhysicalAddr RequestContext::GetRealPba()$/;"	f	class:RequestContext
 GetSlba	zone.cc	/^uint32_t Zone::GetSlba()$/;"	f	class:Zone
-GetZones	zone_group.cc	/^const std::vector<Zone*>& ZoneGroup::GetZones()$/;"	f	class:ZoneGroup
+GetZones	zone_group.cc	/^const std::vector<Zone*>& Segment::GetZones()$/;"	f	class:Segment
 Init	device.cc	/^void Device::Init(struct spdk_nvme_ctrlr *ctrlr, int nsid)$/;"	f	class:Device
 Init	raid_controller.cc	/^void RAIDController::Init()$/;"	f	class:RAIDController
 Init	zone.cc	/^void Zone::Init(Device* device, uint64_t slba, uint64_t length)$/;"	f	class:Zone
@@ -39,7 +39,7 @@ InitZones	device.cc	/^void Device::InitZones()$/;"	f	class:Device
 IsAppend	common.cc	/^bool RequestContext::IsAppend()$/;"	f	class:RequestContext
 IsAvailable	common.cc	/^bool RequestContext::IsAvailable()$/;"	f	class:RequestContext
 IsDone	common.cc	/^bool RequestContext::IsDone()$/;"	f	class:RequestContext
-IsFull	zone_group.cc	/^bool ZoneGroup::IsFull()$/;"	f	class:ZoneGroup
+IsFull	zone_group.cc	/^bool Segment::IsFull()$/;"	f	class:Segment
 LogicalAddr	common.h	/^typedef uint64_t LogicalAddr;$/;"	t
 Metadata	common.h	/^struct Metadata {$/;"	s
 OpenZone	device.cc	/^Zone* Device::OpenZone()$/;"	f	class:Device
@@ -47,12 +47,12 @@ PhysicalAddr	common.h	/^struct PhysicalAddr {$/;"	s
 Poll	device.cc	/^void Device::Poll()$/;"	f	class:Device
 PrintOffset	common.cc	/^void PhysicalAddr::PrintOffset() {$/;"	f	class:PhysicalAddr
 PrintStats	zone.cc	/^void Zone::PrintStats()$/;"	f	class:Zone
-PrintStats	zone_group.cc	/^void ZoneGroup::PrintStats()$/;"	f	class:ZoneGroup
+PrintStats	zone_group.cc	/^void Segment::PrintStats()$/;"	f	class:Segment
 RAIDController	raid_controller.h	/^class RAIDController {$/;"	c
 Read	device.cc	/^void Device::Read(uint64_t offset, uint32_t size, void* data, void *metadata, void* ctx)$/;"	f	class:Device
 Read	raid_controller.cc	/^void RAIDController::Read(uint64_t offset, uint32_t size, void* data)$/;"	f	class:RAIDController
 Read	zone.cc	/^void Zone::Read(uint32_t offset, uint32_t size, void *data, void *metadata, void *ctx)$/;"	f	class:Zone
-Read	zone_group.cc	/^void ZoneGroup::Read(RequestContext *ctx, uint32_t pos)$/;"	f	class:ZoneGroup
+Read	zone_group.cc	/^void Segment::Read(RequestContext *ctx, uint32_t pos)$/;"	f	class:Segment
 Request	common.h	/^struct Request {$/;"	s
 RequestContext	common.h	/^class RequestContext$/;"	c
 ResetZone	device.cc	/^void Device::ResetZone(Zone* zone)$/;"	f	class:Device
@@ -72,8 +72,8 @@ Write	device.cc	/^void Device::Write(uint64_t offset, uint32_t size, void* data,
 Write	raid_controller.cc	/^void RAIDController::Write(uint64_t offset, uint32_t size, void* data)$/;"	f	class:RAIDController
 Write	zone.cc	/^void Zone::Write(uint32_t offset, uint32_t size, void *data, void *metadata, void *ctx)$/;"	f	class:Zone
 Zone	zone.h	/^class Zone {$/;"	c
-ZoneGroup	zone_group.cc	/^ZoneGroup::ZoneGroup(RAIDController *raidController)$/;"	f	class:ZoneGroup
-ZoneGroup	zone_group.h	/^class ZoneGroup$/;"	c
+Segment	zone_group.cc	/^Segment::Segment(RAIDController *raidController)$/;"	f	class:Segment
+Segment	zone_group.h	/^class Segment$/;"	c
 __COMMON_H__	common.h	2;"	d
 __DEVICE_H__	device.h	2;"	d
 __RAID_CONTROLLER_H__	raid_controller.h	2;"	d
@@ -87,7 +87,7 @@ breakpoint	device.cc	/^static void breakpoint() {}$/;"	f	file:
 bytes2Block	device.cc	/^inline uint64_t Device::bytes2Block(uint64_t bytes)$/;"	f	class:Device
 bytes2ZoneNum	device.cc	/^inline uint64_t Device::bytes2ZoneNum(uint64_t bytes)$/;"	f	class:Device
 cb	common.h	/^    spdk_nvme_cmd_cb cb;$/;"	m	struct:RequestContext::__anon1
-checkStripeAvailable	zone_group.cc	/^bool ZoneGroup::checkStripeAvailable(uint32_t id)$/;"	f	class:ZoneGroup
+checkStripeAvailable	zone_group.cc	/^bool Segment::checkStripeAvailable(uint32_t id)$/;"	f	class:Segment
 closeOpenGroup	raid_controller.cc	/^void RAIDController::closeOpenGroup(uint32_t groupId)$/;"	f	class:RAIDController
 ctx	common.h	/^    void *ctx;$/;"	m	struct:RequestContext::__anon1
 data	common.h	/^    void *data;$/;"	m	struct:RequestContext::__anon1
@@ -97,15 +97,15 @@ doExecute	raid_controller.cc	/^void RAIDController::doExecute(Request *op)$/;"	f
 doRead	raid_controller.cc	/^void RAIDController::doRead(RequestContext *ctx)$/;"	f	class:RAIDController
 doWrite	raid_controller.cc	/^void RAIDController::doWrite(RequestContext *ctx)$/;"	f	class:RAIDController
 dummy_disconnect_handler	raid_controller.cc	/^static void dummy_disconnect_handler(struct spdk_nvme_qpair *qpair, void *poll_group_ctx)$/;"	f	file:
-encodeStripe	zone_group.cc	/^void ZoneGroup::encodeStripe(uint8_t *stripe, uint32_t n, uint32_t k, uint32_t stripeUnitSize)$/;"	f	class:ZoneGroup
-findStripe	zone_group.cc	/^bool ZoneGroup::findStripe(RequestContext *ctx)$/;"	f	class:ZoneGroup
+encodeStripe	zone_group.cc	/^void Segment::encodeStripe(uint8_t *stripe, uint32_t n, uint32_t k, uint32_t stripeUnitSize)$/;"	f	class:Segment
+findStripe	zone_group.cc	/^bool Segment::findStripe(RequestContext *ctx)$/;"	f	class:Segment
 flags	common.h	/^    uint32_t flags;$/;"	m	struct:RequestContext::__anon1
 gEnableSyncGroup	raid_controller.cc	/^bool RAIDController::gEnableSyncGroup = true;$/;"	m	class:RAIDController	file:
 gEnableSyncGroup	raid_controller.h	/^  static bool gEnableSyncGroup;$/;"	m	class:RAIDController
-gEncodeMatrix	zone_group.cc	/^uint8_t *ZoneGroup::gEncodeMatrix = nullptr;$/;"	m	class:ZoneGroup	file:
-gEncodeMatrix	zone_group.h	/^  static uint8_t *gEncodeMatrix;$/;"	m	class:ZoneGroup
-gGfTables	zone_group.cc	/^uint8_t *ZoneGroup::gGfTables = nullptr;$/;"	m	class:ZoneGroup	file:
-gGfTables	zone_group.h	/^  static uint8_t *gGfTables;$/;"	m	class:ZoneGroup
+gEncodeMatrix	zone_group.cc	/^uint8_t *Segment::gEncodeMatrix = nullptr;$/;"	m	class:Segment	file:
+gEncodeMatrix	zone_group.h	/^  static uint8_t *gEncodeMatrix;$/;"	m	class:Segment
+gGfTables	zone_group.cc	/^uint8_t *Segment::gGfTables = nullptr;$/;"	m	class:Segment	file:
+gGfTables	zone_group.h	/^  static uint8_t *gGfTables;$/;"	m	class:Segment
 gPollThread	raid_controller.cc	/^struct spdk_thread *RAIDController::gPollThread;$/;"	m	class:RAIDController	typeref:struct:RAIDController::	file:
 gPollThread	raid_controller.h	/^  static struct spdk_thread *gPollThread;$/;"	m	class:RAIDController	typeref:struct:RAIDController::spdk_thread
 gRaidController	main.cpp	/^RAIDController gRaidController;$/;"	v
@@ -114,10 +114,10 @@ gStripeParitySize	common.h	/^static uint32_t gStripeParitySize = 4096 * 1;$/;"	v
 gStripeSize	common.h	/^static uint32_t gStripeSize = 4096 * 3;$/;"	v
 gStripeUnitSize	common.h	/^static uint32_t gStripeUnitSize = 4096;$/;"	v
 g_devices	raid_controller.cc	/^static std::vector<Device*> g_devices;$/;"	v	file:
-getRequestContext	zone_group.cc	/^RequestContext *ZoneGroup::getRequestContext()$/;"	f	class:ZoneGroup
+getRequestContext	zone_group.cc	/^RequestContext *Segment::getRequestContext()$/;"	f	class:Segment
 ioContext	common.h	/^  } ioContext;$/;"	m	class:RequestContext	typeref:struct:RequestContext::__anon1
-isSyncPointDone	zone_group.cc	/^bool ZoneGroup::isSyncPointDone()$/;"	f	class:ZoneGroup
-issueSyncPoint	zone_group.cc	/^void ZoneGroup::issueSyncPoint()$/;"	f	class:ZoneGroup
+isSyncPointDone	zone_group.cc	/^bool Segment::isSyncPointDone()$/;"	f	class:Segment
+issueSyncPoint	zone_group.cc	/^void Segment::issueSyncPoint()$/;"	f	class:Segment
 lba	common.h	/^  uint64_t lba;$/;"	m	struct:Metadata
 lba	common.h	/^  uint64_t lba;$/;"	m	struct:Request
 mAddressMap	raid_controller.h	/^  std::map<LogicalAddr, PhysicalAddr> mAddressMap;$/;"	m	class:RAIDController
@@ -125,62 +125,62 @@ mAssignedPba	common.h	/^  PhysicalAddr mAssignedPba;$/;"	m	class:RequestContext
 mAvailable	common.h	/^  bool mAvailable;$/;"	m	class:RequestContext
 mAvailableZones	device.h	/^  std::vector<Zone*> mAvailableZones;$/;"	m	class:Device
 mBlockSize	raid_controller.h	/^  uint32_t mBlockSize = 4096;$/;"	m	class:RAIDController
-mBlockSize	zone_group.h	/^  uint32_t mBlockSize = 4096;$/;"	m	class:ZoneGroup
-mCapacity	zone_group.h	/^  uint32_t mCapacity = 1024 * 256;$/;"	m	class:ZoneGroup
+mBlockSize	zone_group.h	/^  uint32_t mBlockSize = 4096;$/;"	m	class:Segment
+mCapacity	zone_group.h	/^  uint32_t mCapacity = 1024 * 256;$/;"	m	class:Segment
 mController	device.h	/^  struct spdk_nvme_ctrlr *mController;$/;"	m	class:Device	typeref:struct:Device::spdk_nvme_ctrlr
-mCurStripeId	zone_group.h	/^  uint32_t mCurStripeId;$/;"	m	class:ZoneGroup
+mCurStripeId	zone_group.h	/^  uint32_t mCurStripeId;$/;"	m	class:Segment
 mDevice	zone.h	/^  Device* mDevice;$/;"	m	class:Zone
 mDeviceId	device.h	/^  uint32_t mDeviceId;$/;"	m	class:Device
 mDevices	raid_controller.h	/^  std::vector<Device*> mDevices;$/;"	m	class:RAIDController
 mFinishBytes	common.h	/^  uint32_t mFinishBytes;$/;"	m	class:RequestContext
-mInflightIOs	zone_group.h	/^  std::vector<RequestContext*> mInflightIOs[8];$/;"	m	class:ZoneGroup
+mInflightIOs	zone_group.h	/^  std::vector<RequestContext*> mInflightIOs[8];$/;"	m	class:Segment
 mInflightQueue	raid_controller.h	/^  RequestContext* mInflightQueue;$/;"	m	class:RAIDController
-mInflightStripes	zone_group.h	/^  RequestContext* mInflightStripes[8];$/;"	m	class:ZoneGroup
+mInflightStripes	zone_group.h	/^  RequestContext* mInflightStripes[8];$/;"	m	class:Segment
 mIoQueues	device.h	/^  struct spdk_nvme_qpair* *mIoQueues;$/;"	m	class:Device	typeref:struct:Device::spdk_nvme_qpair
 mIsAppend	common.h	/^  bool mIsAppend;$/;"	m	class:RequestContext
 mIsDone	common.h	/^  bool mIsDone;$/;"	m	class:RequestContext
 mLba	common.h	/^  uint64_t mLba;$/;"	m	class:RequestContext
 mLength	zone.h	/^  uint32_t mLength; \/\/ in blocks$/;"	m	class:Zone
 mLinkedSlot	common.h	/^  RequestContext* mLinkedSlot;$/;"	m	class:RequestContext
-mLogicalAddrs	zone_group.h	/^  std::vector< std::vector<LogicalAddr> > mLogicalAddrs;$/;"	m	class:ZoneGroup
+mLogicalAddrs	zone_group.h	/^  std::vector< std::vector<LogicalAddr> > mLogicalAddrs;$/;"	m	class:Segment
 mNamespace	device.h	/^  struct spdk_nvme_ns *mNamespace;$/;"	m	class:Device	typeref:struct:Device::spdk_nvme_ns
 mNumInflightRequests	raid_controller.h	/^  uint32_t mNumInflightRequests = 16;$/;"	m	class:RAIDController
-mNumInflightStripes	zone_group.h	/^  uint32_t mNumInflightStripes = 8;$/;"	m	class:ZoneGroup
+mNumInflightStripes	zone_group.h	/^  uint32_t mNumInflightStripes = 8;$/;"	m	class:Segment
 mNumInvalidBlocks	zone.h	/^  uint32_t mNumInvalidBlocks;$/;"	m	class:Zone
-mNumInvalidBlocks	zone_group.h	/^  uint32_t mNumInvalidBlocks;$/;"	m	class:ZoneGroup
+mNumInvalidBlocks	zone_group.h	/^  uint32_t mNumInvalidBlocks;$/;"	m	class:Segment
 mNumOpenGroups	raid_controller.h	/^  uint32_t mNumOpenGroups = 1;$/;"	m	class:RAIDController
 mNumZones	device.h	/^  uint32_t mNumZones; \/\/ in blocks$/;"	m	class:Device
 mOffset	common.h	/^  uint32_t mOffset;$/;"	m	struct:PhysicalAddr
 mOp	common.h	/^  Request *mOp;$/;"	m	class:RequestContext
-mOpenGroups	raid_controller.h	/^  ZoneGroup* mOpenGroups[8];$/;"	m	class:RAIDController
+mOpenGroups	raid_controller.h	/^  Segment* mOpenGroups[8];$/;"	m	class:RAIDController
 mPollGroup	raid_controller.h	/^  struct spdk_nvme_poll_group *mPollGroup;$/;"	m	class:RAIDController	typeref:struct:RAIDController::spdk_nvme_poll_group
 mPos	zone.h	/^  uint32_t mPos; \/\/ in blocks$/;"	m	class:Zone
-mRaidController	zone_group.h	/^  RAIDController *mRaidController;$/;"	m	class:ZoneGroup
+mRaidController	zone_group.h	/^  RAIDController *mRaidController;$/;"	m	class:Segment
 mRealPba	common.h	/^  PhysicalAddr mRealPba;$/;"	m	class:RequestContext
-mRequestContextPool	zone_group.h	/^  RequestContext* mRequestContextPool;$/;"	m	class:ZoneGroup
-mRequestContextPoolAvailable	zone_group.h	/^  bool mRequestContextPoolAvailable[64];$/;"	m	class:ZoneGroup
+mRequestContextPool	zone_group.h	/^  RequestContext* mRequestContextPool;$/;"	m	class:Segment
+mRequestContextPoolAvailable	zone_group.h	/^  bool mRequestContextPoolAvailable[64];$/;"	m	class:Segment
 mSlba	zone.h	/^  uint64_t mSlba; \/\/ in blocks$/;"	m	class:Zone
-mStripeDataBuffer	zone_group.h	/^  uint8_t *mStripeDataBuffer[8];$/;"	m	class:ZoneGroup
-mStripeMetadataBuffer	zone_group.h	/^  uint8_t *mStripeMetadataBuffer[8];$/;"	m	class:ZoneGroup
+mStripeDataBuffer	zone_group.h	/^  uint8_t *mStripeDataBuffer[8];$/;"	m	class:Segment
+mStripeMetadataBuffer	zone_group.h	/^  uint8_t *mStripeMetadataBuffer[8];$/;"	m	class:Segment
 mStripePos	raid_controller.h	/^  uint32_t mStripePos;$/;"	m	class:RAIDController
-mStripePos	zone_group.h	/^  uint32_t mStripePos;$/;"	m	class:ZoneGroup
-mSyncGroupSize	zone_group.h	/^  uint32_t mSyncGroupSize = 256;$/;"	m	class:ZoneGroup
-mSyncGroupStatus	zone_group.h	/^  uint32_t mSyncGroupStatus;$/;"	m	class:ZoneGroup
-mSyncPoint	zone_group.h	/^  SyncPoint mSyncPoint;$/;"	m	class:ZoneGroup
+mStripePos	zone_group.h	/^  uint32_t mStripePos;$/;"	m	class:Segment
+mSyncGroupSize	zone_group.h	/^  uint32_t mSyncGroupSize = 256;$/;"	m	class:Segment
+mSyncGroupStatus	zone_group.h	/^  uint32_t mSyncGroupStatus;$/;"	m	class:Segment
+mSyncPoint	zone_group.h	/^  SyncPoint mSyncPoint;$/;"	m	class:Segment
 mTargetBytes	common.h	/^  uint32_t mTargetBytes;$/;"	m	class:RequestContext
-mUsedGroups	raid_controller.h	/^  std::vector<ZoneGroup*> mUsedGroups;$/;"	m	class:RAIDController
+mUsedGroups	raid_controller.h	/^  std::vector<Segment*> mUsedGroups;$/;"	m	class:RAIDController
 mUsedZones	device.h	/^  std::map<int, Zone*> mUsedZones;$/;"	m	class:Device
 mZoneCapacity	device.h	/^  uint64_t mZoneCapacity; \/\/ in blocks$/;"	m	class:Device
-mZoneGroup	common.h	/^  ZoneGroup* mZoneGroup;$/;"	m	struct:PhysicalAddr
+mSegment	common.h	/^  Segment* mSegment;$/;"	m	struct:PhysicalAddr
 mZoneId	common.h	/^  uint32_t mZoneId;$/;"	m	struct:PhysicalAddr
-mZonePos	zone_group.h	/^  uint32_t mZonePos;$/;"	m	class:ZoneGroup
+mZonePos	zone_group.h	/^  uint32_t mZonePos;$/;"	m	class:Segment
 mZoneSize	device.h	/^  uint64_t mZoneSize; \/\/ in blocks$/;"	m	class:Device
 mZones	device.h	/^  Zone* mZones;$/;"	m	class:Device
-mZones	zone_group.h	/^  std::vector<Zone*> mZones;$/;"	m	class:ZoneGroup
+mZones	zone_group.h	/^  std::vector<Zone*> mZones;$/;"	m	class:Segment
 main	main.cpp	/^int main()$/;"	f
 metadata	common.h	/^    void *metadata;$/;"	m	struct:RequestContext::__anon1
 metadata	common.h	/^  uint8_t *metadata;$/;"	m	struct:SyncPoint
-needSyncPoint	zone_group.cc	/^bool ZoneGroup::needSyncPoint()$/;"	f	class:ZoneGroup
+needSyncPoint	zone_group.cc	/^bool Segment::needSyncPoint()$/;"	f	class:Segment
 ns	common.h	/^    struct spdk_nvme_ns *ns;$/;"	m	struct:RequestContext::__anon1	typeref:struct:RequestContext::__anon1::spdk_nvme_ns
 offset	common.h	/^    uint64_t offset;$/;"	m	struct:RequestContext::__anon1
 offset2Bytes	zone.cc	/^inline uint64_t Zone::offset2Bytes(uint64_t size)$/;"	f	class:Zone
@@ -191,14 +191,14 @@ qpair	common.h	/^    struct spdk_nvme_qpair *qpair;$/;"	m	struct:RequestContext:
 queueRequest	raid_controller.cc	/^RequestContext* RAIDController::queueRequest(Request *op)$/;"	f	class:RAIDController
 read	device.cc	/^static auto read(void *args)$/;"	f	file:
 readComplete	device.cc	/^static auto readComplete = [](void *arg, const struct spdk_nvme_cpl *completion)$/;"	v	file:
-returnRequestContext	zone_group.cc	/^void ZoneGroup::returnRequestContext(RequestContext *slot)$/;"	f	class:ZoneGroup
+returnRequestContext	zone_group.cc	/^void Segment::returnRequestContext(RequestContext *slot)$/;"	f	class:Segment
 size	common.h	/^    uint32_t size;$/;"	m	struct:RequestContext::__anon1
 size	common.h	/^  uint32_t size;$/;"	m	struct:Request
 slots	common.h	/^  RequestContext slots[3];$/;"	m	struct:SyncPoint
 status	common.h	/^  uint8_t status;$/;"	m	struct:Request
 tryGc	raid_controller.cc	/^void RAIDController::tryGc()$/;"	f	class:RAIDController
 type	common.h	/^  uint8_t type;$/;"	m	struct:Request
-updateSyncPoint	zone_group.cc	/^void ZoneGroup::updateSyncPoint(uint32_t zoneId, uint32_t logicalOffset, uint32_t physicalOffset)$/;"	f	class:ZoneGroup
+updateSyncPoint	zone_group.cc	/^void Segment::updateSyncPoint(uint32_t zoneId, uint32_t logicalOffset, uint32_t physicalOffset)$/;"	f	class:Segment
 validate	main.cpp	/^void validate()$/;"	f
 write	device.cc	/^static auto write(void *args)$/;"	f	file:
 writeComplete	device.cc	/^static auto writeComplete = [](void *arg, const struct spdk_nvme_cpl *completion) -> void$/;"	v	file:

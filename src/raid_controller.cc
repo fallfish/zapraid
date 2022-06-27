@@ -127,11 +127,6 @@ void RAIDController::Init(bool need_env)
     mAvailableRequestContext.emplace_back(&mRequestContextPool[i]);
   }
 
-  // Preallocate zone group pointers
-  mOpenZoneGroups.resize(mNumOpenZoneGroups);
-  for (uint32_t i = 0; i < mNumOpenZoneGroups; ++i) {
-    mOpenZoneGroups[i] = nullptr;
-  }
 
   // Initialize address map
   mAddressMap = new std::map<LogicalAddr, PhysicalAddr>();
@@ -150,20 +145,29 @@ void RAIDController::Init(bool need_env)
     mDevices[i]->ConnectIoPairs();
   }
 
-  initDispatchThread();
   initIoThread();
+  initDispatchThread();
+
+  // Preallocate zone group pointers
+  mOpenSegments.resize(mNumOpenSegments);
+  for (uint32_t i = 0; i < mNumOpenSegments; ++i) {
+    createSegmentIfNeeded(&mOpenSegments[i]);
+  }
+  if (Configuration::GetSystemMode() == ZNS_RAID_WITH_REDIRECTION) {
+    createSegmentIfNeeded(&mSpareSegment);
+  }
 
   // init Gc
   initGc();
 
-  printf("Finish init zns raid, system mode: %d\n", Configuration::GetSystemMode());
+  Configuration::PrintConfigurations();
 }
 
 RAIDController::~RAIDController()
 {
-  for (auto zoneGroup : mSealedZoneGroups) {
-    printf("Zone group: %p\n", zoneGroup);
-//    zoneGroup->Reset();
+  for (auto segment : mSealedSegments) {
+    printf("Zone group: %p\n", segment);
+//    segment->Reset();
   }
   for (uint32_t i = 0; i < Configuration::GetNumIoThreads(); ++i) {
     spdk_thread_send_msg(mIoThread[i].thread, quit, nullptr);
@@ -214,14 +218,21 @@ void RAIDController::UpdateIndex(uint64_t lba, PhysicalAddr pba)
   // Invalidate the old block
   if (mAddressMap->find(lba) != mAddressMap->end()) {
     PhysicalAddr oldPba = (*mAddressMap)[lba];
-    oldPba.zoneGroup->InvalidateBlock(pba.zoneId, pba.offset);
+    oldPba.segment->InvalidateBlock(pba.zoneId, pba.offset);
     mNumInvalidBlocks += 1;
   }
-  assert(pba.zoneGroup != nullptr);
+  assert(pba.segment != nullptr);
   // Update the new mapping
   (*mAddressMap)[lba] = pba;  
-  pba.zoneGroup->FinishBlock(pba.zoneId, pba.offset, lba);
+  pba.segment->FinishBlock(pba.zoneId, pba.offset, lba);
   mNumBlocks += 1;
+
+//  IndexUpdateEntry entry;
+//  entry.lba = lba;
+//  entry.segmentId = pba.segment->GetSegmentId();
+//  entry.zoneId = pba.zoneId;
+//  entry.zoneId = pba.offset;
+//  mPersistentMetadata->AddIndexUpdateEntry(&entry);
 }
 
 void RAIDController::Write(
@@ -265,6 +276,7 @@ RequestContext* RAIDController::getRequestContext()
 
   ctx->Clear();
   ctx->available = false;
+  ctx->meta = nullptr;
   ctx->ctrl = this;
   return ctx;
 }
@@ -275,7 +287,7 @@ void RAIDController::doExecute(
 {
   RequestContext *ctx = getRequestContext();
   ctx->type = USER;
-  ctx->data = data;
+  ctx->data = (uint8_t*)data;
   ctx->lba = offset;
   ctx->size = size;
   ctx->targetBytes = size;
@@ -298,6 +310,9 @@ void RAIDController::WriteInDispatchThread(RequestContext *ctx)
   uint32_t curOffset = ctx->curOffset;
   uint32_t size = ctx->size;
   uint32_t pos = curOffset;
+  if (ctx->timestamp == ~0ull) {
+    ctx->timestamp = mGlobalTimestamp++;
+  }
 
   if (curOffset == 0) {
     ctx->pbaArray.resize(size / blockSize);
@@ -306,15 +321,37 @@ void RAIDController::WriteInDispatchThread(RequestContext *ctx)
   for ( ; pos < size; pos += blockSize) {
     uint32_t openGroupId = 0;
     bool success = false;
-    for (uint32_t trys = 0; trys < mNumOpenZoneGroups; trys += 1) {
-      createZoneGroupIfNeeded(&mOpenZoneGroups[openGroupId]);
-      success = mOpenZoneGroups[openGroupId]->Append(ctx, pos);
-      sealZoneGroupIfNeeded(&mOpenZoneGroups[openGroupId]);
+    // If spare is enabled and the stripe waits for a second stripe; flush it.
+    for (uint32_t trys = 0; trys < mNumOpenSegments; trys += 1) {
+      assert(mOpenSegments[openGroupId]);
+
+      success = mOpenSegments[openGroupId]->Append(ctx, pos);
+      if (mOpenSegments[openGroupId]->IsFull()) {
+        mSegmentsToSeal.emplace_back(mOpenSegments[openGroupId]);
+        mOpenSegments[openGroupId] = nullptr;
+      }
+//      sealSegmentIfNeeded(&mOpenSegments[openGroupId]);
+      createSegmentIfNeeded(&mOpenSegments[openGroupId]);
       if (success) {
         break;
       }
-      openGroupId = (openGroupId + 1) % mNumOpenZoneGroups; 
+      openGroupId = (openGroupId + 1) % mNumOpenSegments; 
     }
+
+    if (Configuration::GetSystemMode() == ZNS_RAID_WITH_REDIRECTION && !success) {
+      // If enabled spare, try spare
+      success = mSpareSegment->Append(ctx, pos);
+      if (success) {
+//        printf("Successfully write to spare!\n");
+      }
+//      sealSegmentIfNeeded(&mSpareSegment);
+      if (mSpareSegment->IsFull()) {
+        mSegmentsToSeal.emplace_back(mSpareSegment);
+        mSpareSegment = nullptr;
+      }
+      createSegmentIfNeeded(&mSpareSegment);
+    }
+
     if (!success) {
       EnqueueEvent(ctx);
       break;
@@ -361,8 +398,8 @@ void RAIDController::ReadInDispatchThread(RequestContext *ctx)
   for (auto pr : validLbas) {
     uint64_t lba = pr.first;
     PhysicalAddr phyAddr = pr.second;
-    ZoneGroup *zoneGroup = phyAddr.zoneGroup;
-    zoneGroup->Read(ctx, lba - slba, phyAddr);
+    Segment *segment = phyAddr.segment;
+    segment->Read(ctx, lba - slba, phyAddr);
   }
 }
 
@@ -371,19 +408,27 @@ bool RAIDController::scheduleGc()
   if (mNumBlocks == 0 || 1.0 * mNumInvalidBlocks / mNumBlocks < 0.15) {
     return false;
   }
+  printf("NumBlocks: %ld, NumInvalidBlocks: %ld, ratio: %lf\n", mNumBlocks, mNumInvalidBlocks, (double)mNumInvalidBlocks / mNumBlocks);
 
   // Use Greedy algorithm to pick segments
-  std::vector<ZoneGroup*> groups;
-  groups.insert(groups.end(), mSealedZoneGroups.begin(), mSealedZoneGroups.end());
-  std::sort(groups.begin(), groups.end(), [](const ZoneGroup *lhs, const ZoneGroup *rhs) {
+  std::vector<Segment*> groups;
+  for (Segment *segment : mSealedSegments) {
+    if (!segment->CheckOutstandingWrite()) {
+      groups.emplace_back(segment);
+    }
+  }
+  if (groups.size() == 0) {
+    return false;
+  }
+  std::sort(groups.begin(), groups.end(), [](const Segment *lhs, const Segment *rhs) {
       double score1 = (double)lhs->GetNumInvalidBlocks() / rhs->GetNumBlocks();
       double score2 = (double)lhs->GetNumInvalidBlocks() / rhs->GetNumBlocks(); 
       return score1 < score2;
       });
 
-  mGcTask.inputZoneGroup = groups[0];
+  mGcTask.inputSegment = groups[0];
 
-  mSealedZoneGroups.erase(std::find(mSealedZoneGroups.begin(), mSealedZoneGroups.end(), groups[0]));
+  mSealedSegments.erase(std::find(mSealedSegments.begin(), mSealedSegments.end(), groups[0]));
 
   mGcTask.maxZoneId = Configuration::GetStripeDataSize() / Configuration::GetStripeUnitSize();
   mGcTask.maxOffset = Configuration::GetZoneCapacity();
@@ -396,6 +441,10 @@ bool RAIDController::scheduleGc()
 bool RAIDController::ProceedGc()
 {
   bool hasProgress = false;
+  if (!Configuration::GetEnableGc()) {
+    return hasProgress;
+  }
+
   if (mGcTask.stage == IDLE) { // IDLE
     if (scheduleGc()) {
       hasProgress = true;
@@ -414,11 +463,11 @@ bool RAIDController::ProceedGc()
 
     if (mGcTask.curZoneId == mGcTask.maxZoneId) {
       if (mGcTask.numWriteFinish == mGcTask.numWriteSubmitted) {
-        printf("Number of valid rewritten blocks: %lu\n", mGcTask.mappings.size());
+        printf("Number of valid rewritten blocks: %lu, num blocks in zone group: %lu\n", mGcTask.mappings.size(), mGcTask.inputSegment->GetNumBlocks());
         mGcTask.stage = COMPLETE;
       } else {
-        if (mGcTask.outputZoneGroup != nullptr) {
-          mGcTask.outputZoneGroup->FlushStripe();
+        if (mGcTask.outputSegment != nullptr) {
+          mGcTask.outputSegment->FlushStripe();
         }
       }
     }
@@ -428,10 +477,11 @@ bool RAIDController::ProceedGc()
     hasProgress = true;
     progressGcIndexUpdate();
     if (mGcTask.mappings.size() == 0) {
-      mNumInvalidBlocks -= mGcTask.inputZoneGroup->GetNumBlocks();
-      mNumBlocks -= mGcTask.inputZoneGroup->GetNumBlocks();
+      mNumInvalidBlocks -= mGcTask.inputSegment->GetNumBlocks();
+      mNumBlocks -= mGcTask.inputSegment->GetNumBlocks();
+      assert(mNumInvalidBlocks > 0);
       printf("Complete finishing\n");
-      mGcTask.inputZoneGroup->Reset();
+      mGcTask.inputSegment->Reset(nullptr);
       mGcTask.stage = IDLE;
     }
   }
@@ -462,29 +512,30 @@ bool RAIDController::ExistsGc()
   return mGcTask.stage != IDLE;
 }
 
-void RAIDController::createZoneGroupIfNeeded(ZoneGroup **zoneGroup)
+void RAIDController::createSegmentIfNeeded(Segment **segment)
 {
-  if (*zoneGroup != nullptr) return;
+  if (*segment != nullptr) return;
 
-  *zoneGroup = new ZoneGroup(this);
-  printf("Create new zone group: %p\n", *zoneGroup);
+  *segment = new Segment(this, mNextAssignedSegmentId++);
+  printf("Create new zone group: %p\n", *segment);
   for (uint32_t i = 0; i < Configuration::GetStripeSize() / Configuration::GetStripeUnitSize(); ++i) {
     Zone* zone = mDevices[i]->OpenZone();
     if (zone == nullptr) {
       printf("No available zone in device %d, storage space is exhuasted!\n", i);
     }
     printf("Allocate new zone: %p %p\n", zone, mDevices[i]);
-    (*zoneGroup)->AddZone(zone);
+    (*segment)->AddZone(zone);
   }
+  (*segment)->FinalizeSegmentHeader();
 }
 
-void RAIDController::sealZoneGroupIfNeeded(ZoneGroup **zoneGroup)
+void RAIDController::sealSegmentIfNeeded(Segment **segment)
 {
-  if ((*zoneGroup)->IsFull()) {
-    printf("Seal old zone group: %p\n", *zoneGroup);
-//    (*zoneGroup)->Seal();
-    mSealedZoneGroups.emplace_back(*zoneGroup);
-    *zoneGroup = nullptr;
+  if ((*segment)->IsFull()) {
+    printf("Seal old zone group: %p\n", *segment);
+//    (*segment)->Seal();
+    mSealedSegments.emplace_back(*segment);
+    *segment = nullptr;
   }
 }
 
@@ -571,11 +622,11 @@ bool RAIDController::progressGcReader()
 
       bool valid = false;
       do {
-        nextReader->zoneGroup = mGcTask.inputZoneGroup;
+        nextReader->segment = mGcTask.inputSegment;
         nextReader->zoneId = mGcTask.curZoneId;
         nextReader->offset = mGcTask.nextOffset;
 
-        mGcTask.inputZoneGroup->ReadValid(
+        mGcTask.inputSegment->ReadValid(
             nextReader, 0, nextReader->GetPba(), &valid);
 
         mGcTask.nextOffset += 1;
@@ -613,13 +664,14 @@ bool RAIDController::progressGcWriter()
     nextWriter->status = WRITE_REAPING;
     nextWriter->successBytes = 0;
     nextWriter->available = false;
+    nextWriter->timestamp = ((BlockMetadata*)nextWriter->meta)->d.timestamp;
 
-    createZoneGroupIfNeeded(&mGcTask.outputZoneGroup);
-    if (!mGcTask.outputZoneGroup->Append(nextWriter, 0)) {
+    createSegmentIfNeeded(&mGcTask.outputSegment);
+    if (!mGcTask.outputSegment->Append(nextWriter, 0)) {
       nextWriter->CopyFrom(backup);
       break;
     }
-    sealZoneGroupIfNeeded(&mGcTask.outputZoneGroup);
+    sealSegmentIfNeeded(&mGcTask.outputSegment);
 
     mGcTask.mappings[lba] = std::make_pair(oldPba, PhysicalAddr());
     mGcTask.numWriteSubmitted += 1;
@@ -648,4 +700,40 @@ void RAIDController::progressGcIndexUpdate()
   }
 
   GcBatchUpdateIndex(lbas, pbas);
+}
+
+bool RAIDController::CheckSegments()
+{
+  struct timeval s, e;
+  gettimeofday(&s, NULL);
+
+  bool stateChanged = false;
+  for (Segment *segment : mOpenSegments) {
+    if (segment != nullptr) {
+      stateChanged |= segment->StateTransition();
+    }
+  }
+  if (mSpareSegment != nullptr) {
+    stateChanged |= mSpareSegment->StateTransition();
+  }
+
+  std::vector<Segment*> sealedSegments;
+  for (auto it = mSegmentsToSeal.begin();
+      it != mSegmentsToSeal.end();
+      )
+  {
+    stateChanged |= (*it)->StateTransition();
+    if ((*it)->GetStatus() == SEGMENT_SEALED) {
+      printf("Sealed!\n");
+      it = mSegmentsToSeal.erase(it);
+      mSealedSegments.push_back(*it);
+    } else {
+      ++it;
+    }
+  }
+  gettimeofday(&e, NULL);
+//    double elapsed = e.tv_sec - s.tv_sec + e.tv_usec / 1000000. - s.tv_usec / 1000000.;
+//    printf("%f\n", elapsed);
+  
+  return stateChanged;
 }

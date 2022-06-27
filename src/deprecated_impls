@@ -26,9 +26,9 @@ void RAIDController::doRead(RequestContext *ctx)
   for (auto pr : validLbas) {
     uint64_t lba = pr.first;
     PhysicalAddr phyAddr = pr.second;
-    ZoneGroup *zoneGroup = phyAddr.zoneGroup;
+    Segment *segment = phyAddr.segment;
 
-    TryReadFromZoneGroupArgs args;
+    TryReadFromSegmentArgs args;
     args.requestContext = ctx;
     args.pos = lba - slba;
     args.phyAddr = phyAddr;
@@ -38,10 +38,9 @@ void RAIDController::doRead(RequestContext *ctx)
     while (!args.success) {
       args.ready = false;
       spdk_thread_send_msg(mDispatchThread,
-          tryReadFromZoneGroup,
+          tryReadFromSegment,
           &args);
       busyWait(&args.ready);
     }
   }
 }
-

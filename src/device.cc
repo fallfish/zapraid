@@ -3,9 +3,17 @@
 #include <rte_errno.h>
 #include "raid_controller.h"
 #include "zone.h"
+#include "poller.h"
 
 #include "spdk/nvme.h"
 
+void notifyCompletion(RequestContext *slot)
+{
+  RAIDController *ctrl = slot->ctrl;
+  if (spdk_thread_send_msg(ctrl->GetDispatchThread(), handlEventsCompletionsOneEvent, slot) < 0) {
+    printf("notify %p completion failed, error %s\n", slot, rte_strerror(rte_errno));
+  }
+}
 
 
 static void writeComplete(void *arg, const struct spdk_nvme_cpl *completion)
@@ -39,7 +47,7 @@ static void readComplete(void *arg, const struct spdk_nvme_cpl *completion)
 static void resetComplete(void *arg, const struct spdk_nvme_cpl *completion)
 {
   RequestContext *slot = (RequestContext*)arg;
-//  slot->Queue();
+  slot->Queue();
 
   if (spdk_nvme_cpl_is_error(completion)) {
     fprintf(stderr, "I/O error status: %s\n", spdk_nvme_cpl_get_status_string(&completion->status));
@@ -52,7 +60,7 @@ static void resetComplete(void *arg, const struct spdk_nvme_cpl *completion)
 static void finishComplete(void *arg, const struct spdk_nvme_cpl *completion)
 {
   RequestContext *slot = (RequestContext*)arg;
-//  slot->Queue();
+  slot->Queue();
 
   if (spdk_nvme_cpl_is_error(completion)) {
     fprintf(stderr, "I/O error status: %s\n", spdk_nvme_cpl_get_status_string(&completion->status));
@@ -66,7 +74,7 @@ static void appendComplete(void *arg, const struct spdk_nvme_cpl *completion)
   RequestContext *slot = (RequestContext*)arg;
 //  printf("AppendComplete: %p %s\n", slot->ioContext.data, (uint8_t*)slot->ioContext.data);
   slot->successBytes += Configuration::GetStripeUnitSize();
-  slot->offset &= (*(uint64_t *)&completion->cdw0);
+  slot->offset = slot->offset & completion->cdw0;
   slot->Queue();
 
   if (spdk_nvme_cpl_is_error(completion)) {
@@ -81,6 +89,12 @@ static void write(void *args)
   auto ioCtx = ((RequestContext*)args)->ioContext;
   ((RequestContext*)args)->stime = timestamp();
   int rc = 0;
+//  RequestContext *slot = (RequestContext*)args;
+//  slot->successBytes += Configuration::GetStripeUnitSize();
+////  notifyCompletion(slot);
+////  slot->Queue();
+//  return;
+
   if (Configuration::GetDeviceSupportMetadata()) {
     rc = spdk_nvme_ns_cmd_write_with_md(ioCtx.ns, ioCtx.qpair,
                                   ioCtx.data, ioCtx.metadata,
@@ -128,6 +142,13 @@ static void append(void *args)
 {
   auto ioCtx = ((RequestContext*)args)->ioContext;
   ((RequestContext*)args)->stime = timestamp();
+//   RequestContext *slot = (RequestContext*)args;
+//   slot->successBytes += Configuration::GetStripeUnitSize();
+//   slot->offset = slot->offset & slot->stripeId;
+//   notifyCompletion(slot);
+// //  slot->Queue();
+
+//  return;
   int rc = 0;
   if (Configuration::GetDeviceSupportMetadata()) {
     rc = spdk_nvme_zns_zone_append_with_md(ioCtx.ns, ioCtx.qpair,
@@ -214,7 +235,6 @@ void Device::ConnectIoPairs()
   auto resetComplete = [](void *arg, const struct spdk_nvme_cpl *completion) {
     bool *done = (bool*)arg;
     *done = true;
-    printf("Namespace reset.\n");
   };
 
   spdk_nvme_zns_reset_zone(mNamespace, mIoQueues[0], 0, true, resetComplete, &done);
@@ -297,7 +317,7 @@ void Device::Write(uint64_t offset, uint32_t size, void* ctx)
 
 void Device::Append(uint64_t offset, uint32_t size, void* ctx)
 {
-  static int curThread = 2; // gNumPollThreads - 1;
+  static int curThread = 0; // gNumPollThreads - 1;
   RequestContext *slot = (RequestContext*)ctx;
 //  printf("Append: %p %s\n", slot->data, (uint8_t*)slot->data);
   slot->ioContext.ns = mNamespace;
@@ -313,6 +333,7 @@ void Device::Append(uint64_t offset, uint32_t size, void* ctx)
     printf("send %p failed, error %s\n", slot, rte_strerror(rte_errno));
     assert(0);
   } 
+  curThread = (curThread + 1) % Configuration::GetNumIoThreads();
 }
 
 void Device::Read(uint64_t offset, uint32_t size, void* ctx)

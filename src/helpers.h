@@ -1,15 +1,3 @@
-struct ResetZoneGroupArgs {
-  ZoneGroup *zoneGroup;
-  bool ready;
-};
-
-void resetZoneGroup(void *args)
-{
-  ResetZoneGroupArgs *args1 = (ResetZoneGroupArgs*)args;
-  args1->zoneGroup->Reset();
-  args1->ready = true;
-}
-
 struct DrainArgs {
   RAIDController *ctrl;
   bool success;
@@ -27,7 +15,7 @@ void tryDrainController(void *args)
 }
 
 
-struct TryReadFromZoneGroupArgs {
+struct TryReadFromSegmentArgs {
   RequestContext *requestContext;
   PhysicalAddr phyAddr;
   uint32_t pos;
@@ -35,33 +23,33 @@ struct TryReadFromZoneGroupArgs {
   bool success;
 };
 
-void tryReadFromZoneGroup(void *args)
+void tryReadFromSegment(void *args)
 {
-  TryReadFromZoneGroupArgs *args1 = (TryReadFromZoneGroupArgs *)args;
-  args1->success = args1->phyAddr.zoneGroup->Read(args1->requestContext,
+  TryReadFromSegmentArgs *args1 = (TryReadFromSegmentArgs *)args;
+  args1->success = args1->phyAddr.segment->Read(args1->requestContext,
                                                 args1->pos, args1->phyAddr);
   printf("ctx: %p, success: %d\n", args1->requestContext, args1->success);
   args1->ready = true;
 }
 
-struct TryAppendToZoneGroupArgs {
-  ZoneGroup *zoneGroup;
+struct TryAppendToSegmentArgs {
+  Segment *segment;
   RequestContext *requestContext;
   uint32_t pos;
   bool ready;
   bool success;
 };
 
-void tryAppendToZoneGroup(void *args)
+void tryAppendToSegment(void *args)
 {
-  TryAppendToZoneGroupArgs *args1 = (TryAppendToZoneGroupArgs *)args;
-  ZoneGroup *zoneGroup = args1->zoneGroup;
+  TryAppendToSegmentArgs *args1 = (TryAppendToSegmentArgs *)args;
+  Segment *segment = args1->segment;
   RequestContext *reqCtx = args1->requestContext;
 
   if (reqCtx != nullptr) {
-    args1->success = zoneGroup->Append(reqCtx, args1->pos);
+    args1->success = segment->Append(reqCtx, args1->pos);
   } else {
-    zoneGroup->FlushStripe();
+    segment->FlushStripe();
   }
   printf("ctx: %p, success: %d\n", reqCtx, args1->success);
   args1->ready = true;

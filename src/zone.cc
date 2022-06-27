@@ -71,7 +71,8 @@ uint32_t Zone::GetLength()
 
 void Zone::PrintStats()
 {
-  printf("device id: %d, slba: %d, length: %d, num invalid blocks: %d\n", GetDeviceId(), mSlba, mLength, mNumInvalidBlocks);
+  printf("device id: %d, slba: %d, length: %d\n",
+      GetDeviceId(), mSlba, mLength);
 }
 
 void Zone::Release()
