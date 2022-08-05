@@ -8,7 +8,27 @@
 #include "raid_controller.h"
 #include <sys/time.h>
 
+struct UpdatePbaArgs {
+  RAIDController *ctrl;
+  RequestContext *ctx;
+};
 
+void updatePba(void *args) {
+  UpdatePbaArgs *qArgs = (UpdatePbaArgs*)args;
+  RequestContext *ctx = qArgs->ctx;
+  assert(ctx->status == WRITE_INDEX_UPDATING);
+  for (uint32_t i = 0; i < ctx->size / Configuration::GetBlockSize(); ++i) {
+    uint64_t lba = ctx->lba + i * Configuration::GetBlockSize();
+    qArgs->ctrl->UpdateIndex(lba, ctx->pbaArray[i]);
+  }
+  free(qArgs);
+  ctx->status = WRITE_COMPLETE;
+  if (ctx->cb_fn != nullptr) {
+    ctx->cb_fn(ctx->cb_args);
+  }
+  ctx->available = true;
+  // ctx->Queue();
+}
 
 static void dummy_disconnect_handler(struct spdk_nvme_qpair *qpair, void *poll_group_ctx)
 {
@@ -16,12 +36,8 @@ static void dummy_disconnect_handler(struct spdk_nvme_qpair *qpair, void *poll_g
 
 int handleIoCompletions(void *args)
 {
-//  printf("Function polling\n");
   struct spdk_nvme_poll_group* pollGroup = (struct spdk_nvme_poll_group*)args;
-  struct timeval s, e;
-  gettimeofday(&s, NULL);
   int r = spdk_nvme_poll_group_process_completions(pollGroup, 0, dummy_disconnect_handler);
-  gettimeofday(&e, NULL);
   return r > 0 ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
 }
 
@@ -32,11 +48,7 @@ int ioWorker(void *args)
   spdk_set_thread(thread);
   spdk_poller_register(handleIoCompletions, ioThread->group, 0);
   while (true) {
-    struct timeval s, e;
-    gettimeofday(&s, NULL);
     spdk_thread_poll(thread, 0, 0);
-    gettimeofday(&e, NULL);
-    double elapsed = e.tv_sec + e.tv_usec / 1000000. - (s.tv_sec + s.tv_usec / 1000000.);
   }
 }
 
@@ -45,28 +57,29 @@ static bool contextReady(RequestContext *ctx)
   return ctx->successBytes == ctx->targetBytes;
 }
 
-static void handleUserContext(RequestContext *context, std::vector<RequestContext*> &needCheck)
+static void handleUserContext(RequestContext *context)
 {
   ContextStatus &status = context->status;
   assert(contextReady(context));
   if (status == WRITE_REAPING) {
-    for (uint32_t i = 0; i < context->size / Configuration::GetBlockSize(); ++i) {
-      context->ctrl->UpdateIndex(context->lba + i * Configuration::GetBlockSize(), context->pbaArray[i]);
+    UpdatePbaArgs *args = (UpdatePbaArgs*)calloc(1, sizeof(UpdatePbaArgs));
+    args->ctrl = context->ctrl;
+    args->ctx = context;
+    status = WRITE_INDEX_UPDATING;
+    if (spdk_thread_send_msg(args->ctrl->GetIndexThread(), updatePba, args) < 0) {
+      printf("Failed!\n");
+      exit(-1);
     }
-    status = WRITE_COMPLETE;
   } else if (status == READ_REAPING) {
     status = READ_COMPLETE;
-  } else {
-    assert(0);
+    if (context->cb_fn != nullptr) {
+      context->cb_fn(context->cb_args);
+    }
+    context->available = true;
   }
-  if (context->cb_fn != nullptr) {
-    context->cb_fn(context->cb_args);
-  }
-//  printf("Context %p set available!\n", context);
-  context->available = true;
 }
 
-void handleGcContext(RequestContext *context, std::vector<RequestContext*> &needCheck)
+void handleGcContext(RequestContext *context)
 {
   ContextStatus &status = context->status;
   if (status == WRITE_REAPING) {
@@ -79,7 +92,7 @@ void handleGcContext(RequestContext *context, std::vector<RequestContext*> &need
   context->available = true;
 }
 
-void handleIndexContext(RequestContext *context, std::vector<RequestContext*> &needCheck)
+void handleIndexContext(RequestContext *context)
 {
   ContextStatus &status = context->status;
   if (status == WRITE_REAPING) {
@@ -93,51 +106,30 @@ void handleIndexContext(RequestContext *context, std::vector<RequestContext*> &n
 }
 
 
-static void handleStripeUnitContext(RequestContext *context, std::vector<RequestContext*> &needCheck)
+static void handleStripeUnitContext(RequestContext *context)
 {
+  static double part1 = 0, part2 = 0, part3 = 0;
+  static int count = 0;
+  struct timeval s, e;
+
   ContextStatus &status = context->status;
   switch (status) {
     case WRITE_REAPING:
       if (context->successBytes == context->targetBytes) {
         if (context->append) {
-          context->segment->UpdateSyncPoint(context->zoneId,
+          context->segment->UpdateNamedMetadata(context->zoneId,
               context->stripeId,
               context->offset);
         }
-
-        if (Configuration::GetStripePersistencyMode() == 0) {
-          RequestContext *parent = context->associatedRequest;
-          if (parent) {
-            parent->pbaArray[(context->lba - parent->lba) / Configuration::GetBlockSize()] = context->GetPba();
-            parent->successBytes += context->targetBytes;
-            if (contextReady(parent)) {
-              needCheck.emplace_back(parent);
-            }
-            assert(parent->successBytes <= parent->targetBytes);
+        RequestContext *parent = context->associatedRequest;
+        if (parent) {
+          parent->pbaArray[(context->lba - parent->lba) / Configuration::GetBlockSize()] = context->GetPba();
+          parent->successBytes += context->targetBytes;
+          if (contextReady(parent)) {
+            handleUserContext(parent);
           }
+          assert(parent->successBytes <= parent->targetBytes);
         }
-
-        if (context->associatedStripe) {
-          context->associatedStripe->successBytes += context->targetBytes;
-          if (context->associatedStripe->successBytes == context->associatedStripe->targetBytes) {
-            // stripe finish, notify the corresponding user request
-            for (auto contextInStripe : context->associatedStripe->ioContext) {
-              if (Configuration::GetStripePersistencyMode() == 1) {
-                RequestContext *parent = contextInStripe->associatedRequest;
-                if (parent) {
-                  parent->pbaArray[(contextInStripe->lba - parent->lba) / Configuration::GetBlockSize()] = contextInStripe->GetPba();
-                  parent->successBytes += contextInStripe->targetBytes;
-                  if (contextReady(parent)) {
-                    needCheck.emplace_back(parent);
-                    //                  printf("Context %p bring back its parent %p!\n", context, parent);
-                  }
-                  assert(parent->successBytes <= parent->targetBytes);
-                }
-              }
-            }
-          }
-        }
-
         context->segment->WriteComplete(context);
         status = WRITE_COMPLETE;
         context->available = true;
@@ -148,7 +140,7 @@ static void handleStripeUnitContext(RequestContext *context, std::vector<Request
       if (context->needDegradedRead) {
         context->needDegradedRead = false;
         SystemMode mode = Configuration::GetSystemMode();
-        if (mode == ZNS_RAID_WITH_META || mode == ZNS_RAID_WITH_REDIRECTION) {
+        if (mode == NAMED_META || mode == REDIRECTION) {
           status = DEGRADED_READ_META;
           context->segment->ReadStripeMeta(context);
         } else {
@@ -159,8 +151,7 @@ static void handleStripeUnitContext(RequestContext *context, std::vector<Request
         context->segment->ReadComplete(context);
         context->associatedRequest->successBytes += Configuration::GetBlockSize();
         if (contextReady(context->associatedRequest)) {
-          needCheck.emplace_back(context->associatedRequest);
-//          printf("Context %p bring back its parent %p!\n", context, context->associatedRequest);
+          handleUserContext(context->associatedRequest);
         }
         assert(context->associatedRequest->successBytes <= context->associatedRequest->targetBytes);
 
@@ -174,7 +165,7 @@ static void handleStripeUnitContext(RequestContext *context, std::vector<Request
       context->segment->ReadComplete(context);
       
       if (contextReady(context->associatedRequest)) {
-        needCheck.emplace_back(context->associatedRequest);
+        handleStripeUnitContext(context->associatedRequest);
       }
       break;
     case DEGRADED_READ_META:
@@ -187,7 +178,7 @@ static void handleStripeUnitContext(RequestContext *context, std::vector<Request
       context->associatedRequest->targetBytes += 1;
       status = RESET_COMPLETE;
       if (contextReady(context->associatedRequest)) {
-        needCheck.emplace_back(context->associatedRequest);
+        handleUserContext(context->associatedRequest);
       }
       context->available = true;
       break;
@@ -202,36 +193,28 @@ static void handleStripeUnitContext(RequestContext *context, std::vector<Request
   }
 }
 
-void handleContext(RequestContext *context, std::vector<RequestContext*> &needCheck)
+void handleContext(RequestContext *context)
 {
+//  if (context->associatedRequest != nullptr) {
+//    RequestContext *ctx = context->associatedRequest;
+//    struct timeval b;
+//    gettimeofday(&b, NULL);
+//    double diff = gettimediff(ctx->timeA, b);
+//    if (diff > 0.000010)
+//    {
+//      printf("Time exceed %p, PointB: %f\n", ctx, diff);
+//    }
+//  }
   ContextType type = context->type;
   if (type == USER) {
-    handleUserContext(context, needCheck);
+    handleUserContext(context);
   } else if (type == STRIPE_UNIT) {
-    handleStripeUnitContext(context, needCheck);
+    handleStripeUnitContext(context);
   } else if (type == GC) {
-    handleGcContext(context, needCheck);
+    handleGcContext(context);
   } else if (type == INDEX) {
-    handleIndexContext(context, needCheck);
+    handleIndexContext(context);
   }
-}
-
-void handlEventsCompletionsOneEvent(void *args)
-{
-  RequestContext *req = (RequestContext*)args;
-  std::vector<RequestContext *> needCheck, needEnqueue;
-  handleContext(req, needEnqueue);
-
-//  RAIDController *ctrl = req->ctrl;
-//  std::queue<RequestContext*>& q = ctrl->GetRequestQueue();
-//  std::mutex& qMutex = ctrl->GetRequestQueueMutex();
-//
-//  qMutex.lock();
-  for (RequestContext *req : needEnqueue) {
-    handleContext(req, needCheck);
-//    q.push(req, needCheck);
-  }
-//  qMutex.unlock();
 }
 
 int handleEventsCompletion(void *args)
@@ -242,50 +225,39 @@ int handleEventsCompletion(void *args)
   int r = 0;
 
   qMutex.lock();
-  std::vector<RequestContext *> needCheck, needEnqueue;
-  needCheck.clear();
-  needEnqueue.clear();
-  while (!q.empty()) {
-    RequestContext *req = q.front();
-    needCheck.emplace_back(req);
-    q.pop();
-
-    ++r;
-  }
+  std::queue<RequestContext *> needCheck;
+  std::swap(needCheck, q);
   qMutex.unlock();
 
-  needEnqueue.clear();
-  for (RequestContext *req : needCheck) {
-    std::vector<RequestContext*> needEnqueueTmp;
-    needEnqueueTmp.clear();
-    assert(req);
-    handleContext(req, needEnqueueTmp);
-    for (auto req1 : needEnqueueTmp) {
-      assert(req1);
-    }
-    needEnqueue.insert(needEnqueue.end(), needEnqueueTmp.begin(), needEnqueueTmp.end());
+  while (!needCheck.empty()) {
+    RequestContext *c = needCheck.front();
+    needCheck.pop();
+    handleContext(c);
   }
-
-  qMutex.lock();
-  for (RequestContext *req : needEnqueue) {
-    q.push(req);
-  }
-  qMutex.unlock();
 
   return r > 0 ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
+}
+
+
+void handleEventsCompletionsOneEvent(void *args)
+{
+  RequestContext *slot = (RequestContext*)args;
+  handleContext(slot);
 }
 
 int handleEventsDispatch(void *args)
 {
   RAIDController *ctrl = (RAIDController*)args;
   std::vector<RequestContext*> eventsToDispatch;
-  std::swap(eventsToDispatch, ctrl->GetEventsToDispatch());
+  if (ctrl->GetEventsToDispatch().size() != 0) {
+    std::swap(eventsToDispatch, ctrl->GetEventsToDispatch());
 
-  for (RequestContext *ctx : eventsToDispatch) {
-    if (ctx->req_type == 'W') {
-      ctrl->WriteInDispatchThread(ctx);
-    } else {
-      ctrl->ReadInDispatchThread(ctx);
+    for (RequestContext *ctx : eventsToDispatch) {
+      if (ctx->req_type == 'W') {
+        ctrl->WriteInDispatchThread(ctx);
+      } else {
+        ctrl->ReadInDispatchThread(ctx);
+      }
     }
   }
 
@@ -306,9 +278,38 @@ int dispatchWorker(void *args)
   RAIDController *raidController = (RAIDController*)args;
   struct spdk_thread *thread = raidController->GetDispatchThread();
   spdk_set_thread(thread);
-  spdk_poller_register(handleEventsCompletion, raidController, 0);
-  spdk_poller_register(handleEventsDispatch, raidController, 1);
-  spdk_poller_register(handleBackgroundTasks, raidController, 20);
+  spdk_poller_register(handleEventsDispatch, raidController, 0);
+  spdk_poller_register(handleBackgroundTasks, raidController, 1);
+  while (true) {
+    spdk_thread_poll(thread, 0, 0);
+  }
+}
+
+int ecWorker(void *args)
+{
+  RAIDController *raidController = (RAIDController*)args;
+  struct spdk_thread *thread = raidController->GetEcThread();
+  printf("Ec: %p\n", thread);
+  spdk_set_thread(thread);
+  while (true) {
+    spdk_thread_poll(thread, 0, 0);
+  }
+}
+
+int indexWorker(void *args) {
+  RAIDController *raidController = (RAIDController*)args;
+  struct spdk_thread *thread = raidController->GetIndexThread();
+  printf("Index: %p\n", thread);
+  spdk_set_thread(thread);
+  while (true) {
+    spdk_thread_poll(thread, 0, 0);
+  }
+}
+
+int completionWorker(void *args) {
+  RAIDController *raidController = (RAIDController*)args;
+  struct spdk_thread *thread = raidController->GetCompletionThread();
+  spdk_set_thread(thread);
   while (true) {
     spdk_thread_poll(thread, 0, 0);
   }

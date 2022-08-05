@@ -1,31 +1,23 @@
 #include "device.h"
 
 #include <rte_errno.h>
+#include <sys/time.h>
 #include "raid_controller.h"
 #include "zone.h"
 #include "poller.h"
 
 #include "spdk/nvme.h"
 
-void notifyCompletion(RequestContext *slot)
-{
-  RAIDController *ctrl = slot->ctrl;
-  if (spdk_thread_send_msg(ctrl->GetDispatchThread(), handlEventsCompletionsOneEvent, slot) < 0) {
-    printf("notify %p completion failed, error %s\n", slot, rte_strerror(rte_errno));
-  }
-}
-
-
 static void writeComplete(void *arg, const struct spdk_nvme_cpl *completion)
 {
   RequestContext *slot = (RequestContext*)arg;
   slot->successBytes += Configuration::GetStripeUnitSize();
   slot->Queue();
-//  printf("WriteComplete: %p %s\n", slot->ioContext.data, (uint8_t*)slot->ioContext.data);
 
   if (spdk_nvme_cpl_is_error(completion)) {
     fprintf(stderr, "I/O error status: %s\n", spdk_nvme_cpl_get_status_string(&completion->status));
     fprintf(stderr, "Write I/O failed, aborting run\n");
+  slot->PrintStats();
     exit(1);
   }
 };
@@ -72,8 +64,8 @@ static void finishComplete(void *arg, const struct spdk_nvme_cpl *completion)
 static void appendComplete(void *arg, const struct spdk_nvme_cpl *completion)
 {
   RequestContext *slot = (RequestContext*)arg;
-//  printf("AppendComplete: %p %s\n", slot->ioContext.data, (uint8_t*)slot->ioContext.data);
   slot->successBytes += Configuration::GetStripeUnitSize();
+//  printf("Offset: %x %x %d %d %d\n", slot->offset, completion->cdw0, slot->offset, completion->cdw0, slot->offset & completion->cdw0);
   slot->offset = slot->offset & completion->cdw0;
   slot->Queue();
 
@@ -86,15 +78,10 @@ static void appendComplete(void *arg, const struct spdk_nvme_cpl *completion)
 
 static void write(void *args)
 {
-  auto ioCtx = ((RequestContext*)args)->ioContext;
-  ((RequestContext*)args)->stime = timestamp();
+  RequestContext *slot = (RequestContext*)args;
+  auto ioCtx = slot->ioContext;
+  slot->stime = timestamp();
   int rc = 0;
-//  RequestContext *slot = (RequestContext*)args;
-//  slot->successBytes += Configuration::GetStripeUnitSize();
-////  notifyCompletion(slot);
-////  slot->Queue();
-//  return;
-
   if (Configuration::GetDeviceSupportMetadata()) {
     rc = spdk_nvme_ns_cmd_write_with_md(ioCtx.ns, ioCtx.qpair,
                                   ioCtx.data, ioCtx.metadata,
@@ -116,8 +103,9 @@ static void write(void *args)
 
 static void read(void *args)
 {
-  auto ioCtx = ((RequestContext*)args)->ioContext;
-  ((RequestContext*)args)->stime = timestamp();
+  RequestContext *slot = (RequestContext*)args;
+  auto ioCtx = slot->ioContext;
+  slot->stime = timestamp();
   int rc = 0;
   if (Configuration::GetDeviceSupportMetadata()) {
     rc = spdk_nvme_ns_cmd_read_with_md(ioCtx.ns, ioCtx.qpair,
@@ -140,15 +128,10 @@ static void read(void *args)
 
 static void append(void *args)
 {
-  auto ioCtx = ((RequestContext*)args)->ioContext;
-  ((RequestContext*)args)->stime = timestamp();
-//   RequestContext *slot = (RequestContext*)args;
-//   slot->successBytes += Configuration::GetStripeUnitSize();
-//   slot->offset = slot->offset & slot->stripeId;
-//   notifyCompletion(slot);
-// //  slot->Queue();
+  RequestContext *slot = (RequestContext*)args;
+  auto ioCtx = slot->ioContext;
+  slot->stime = timestamp();
 
-//  return;
   int rc = 0;
   if (Configuration::GetDeviceSupportMetadata()) {
     rc = spdk_nvme_zns_zone_append_with_md(ioCtx.ns, ioCtx.qpair,
@@ -181,8 +164,10 @@ static void reset(void *args)
 
 static void finish(void *args)
 {
-  auto ioCtx = ((RequestContext*)args)->ioContext;
-  ((RequestContext*)args)->stime = timestamp();
+  RequestContext *slot = (RequestContext*)args;
+  auto ioCtx = slot->ioContext;
+  slot->stime = timestamp();
+
   int rc = spdk_nvme_zns_finish_zone(ioCtx.ns, ioCtx.qpair, ioCtx.offset, 0, ioCtx.cb, ioCtx.ctx);
   if (rc != 0) {
     fprintf(stderr, "Device close error!\n");
@@ -206,9 +191,8 @@ void Device::Init(struct spdk_nvme_ctrlr *ctrlr, int nsid)
   mNamespace = spdk_nvme_ctrlr_get_ns(ctrlr, nsid);
 
   mZoneSize = spdk_nvme_zns_ns_get_zone_size_sectors(mNamespace);
-//  mZoneSize = 1024 * 256 * 2; // spdk_nvme_zns_ns_get_zone_size_sectors(mNamespace);
   mNumZones = spdk_nvme_zns_ns_get_num_zones(mNamespace);
-  mZoneCapacity = mZoneSize; // 1024 * 256;
+  mZoneCapacity = 1077 * 1024 / 4; // 1,077 * 1024 * 1024 / 4096;
   Configuration::SetZoneCapacity(mZoneCapacity);
   printf("Zone size: %d, zone cap: %d, num of zones: %d\n", mZoneSize, mZoneCapacity, mNumZones);
 
@@ -231,6 +215,10 @@ void Device::ConnectIoPairs()
       printf("Connect ctrl failed!\n");
     }
   }
+}
+
+void Device::EraseWholeDevice()
+{
   bool done = false;
   auto resetComplete = [](void *arg, const struct spdk_nvme_cpl *completion) {
     bool *done = (bool*)arg;
@@ -248,7 +236,7 @@ void Device::InitZones()
 {
   mZones = new Zone[mNumZones];
   for (int i = 0; i < mNumZones; ++i) {
-    mZones[i].Init(this, i * mZoneSize, mZoneCapacity);
+    mZones[i].Init(this, i * mZoneSize, mZoneCapacity, mZoneSize);
     mAvailableZones.emplace_back(&mZones[i]);
   }
 }
@@ -260,7 +248,6 @@ Zone* Device::OpenZone()
 
   mUsedZones[zone->GetSlba()] = zone;
   mAvailableZones.pop_back();
-  zone->PrintStats();
 
   return zone;
 }
@@ -291,6 +278,12 @@ void Device::FinishZone(Zone *zone, void *ctx)
   slot->ioContext.ctx = ctx;
   slot->ioContext.offset = zone->GetSlba();
   slot->ioContext.flags = 0;
+
+  if (Configuration::GetBypassDevice()) {
+    slot->Queue();
+    return;
+  }
+
   if (spdk_thread_send_msg(slot->ctrl->GetIoThread(0), finish, slot) < 0) {
     printf("send %p failed, error %s\n", slot, rte_strerror(rte_errno));
   }
@@ -299,7 +292,6 @@ void Device::FinishZone(Zone *zone, void *ctx)
 void Device::Write(uint64_t offset, uint32_t size, void* ctx)
 {
   RequestContext *slot = (RequestContext*)ctx;
-//  printf("Write: %p %s\n", slot->data, (uint8_t*)slot->data);
   slot->ioContext.ns = mNamespace;
   slot->ioContext.qpair = mIoQueues[0];
   slot->ioContext.data = slot->data;
@@ -309,6 +301,13 @@ void Device::Write(uint64_t offset, uint32_t size, void* ctx)
   slot->ioContext.cb = writeComplete;
   slot->ioContext.ctx = ctx;
   slot->ioContext.flags = 0;
+
+  if (Configuration::GetBypassDevice()) {
+    slot->successBytes += Configuration::GetBlockSize();
+    slot->Queue();
+    return;
+  }
+
   if (spdk_thread_send_msg(slot->ctrl->GetIoThread(0), write, slot) < 0) {
     printf("Size of slot: %lu\n", sizeof(*slot));
     assert(0);
@@ -319,7 +318,6 @@ void Device::Append(uint64_t offset, uint32_t size, void* ctx)
 {
   static int curThread = 0; // gNumPollThreads - 1;
   RequestContext *slot = (RequestContext*)ctx;
-//  printf("Append: %p %s\n", slot->data, (uint8_t*)slot->data);
   slot->ioContext.ns = mNamespace;
   slot->ioContext.qpair = mIoQueues[curThread];
   slot->ioContext.data = slot->data;
@@ -329,6 +327,14 @@ void Device::Append(uint64_t offset, uint32_t size, void* ctx)
   slot->ioContext.cb = appendComplete;
   slot->ioContext.ctx = ctx;
   slot->ioContext.flags = 0;
+
+  if (Configuration::GetBypassDevice()) {
+    slot->offset = 0;
+    slot->successBytes += Configuration::GetBlockSize();
+    slot->Queue();
+    return;
+  }
+
   if (spdk_thread_send_msg(slot->ctrl->GetIoThread(curThread), append, slot) < 0) {
     printf("send %p failed, error %s\n", slot, rte_strerror(rte_errno));
     assert(0);
@@ -348,39 +354,14 @@ void Device::Read(uint64_t offset, uint32_t size, void* ctx)
   slot->ioContext.cb = readComplete;
   slot->ioContext.ctx = ctx;
   slot->ioContext.flags = 0;
+
+  if (Configuration::GetBypassDevice()) {
+    slot->successBytes += Configuration::GetBlockSize();
+    slot->Queue();
+    return;
+  }
   if (spdk_thread_send_msg(slot->ctrl->GetIoThread(0), read, slot) < 0) {
     printf("send %p failed, error %s\n", slot, rte_strerror(rte_errno));
-  }
-}
-
-static int polling(void *args)
-{
-  struct spdk_nvme_qpair* qpair = (struct spdk_nvme_qpair *)args;
-  struct timeval s, e;
-  int r = spdk_nvme_qpair_process_completions(qpair, 0);
-  return r > 0 ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
-}
-
-static int pollWorker(void *args)
-{
-  Device *device = (Device*)args;
-  struct spdk_thread *thread = device->GetPollThread();
-  spdk_set_thread(thread);
-  spdk_poller_register(polling, device->GetIoQueues()[0], 0);
-  while (true) {
-    spdk_thread_poll(thread, 0, 0);
-  }
-}
-
-void Device::StartPolling(int coreId)
-{
-  struct spdk_cpuset cpumask;
-  spdk_cpuset_zero(&cpumask);
-  spdk_cpuset_set_cpu(&cpumask, coreId, true);
-  mPollThread = spdk_thread_create("Polling", &cpumask);
-  int rc = spdk_env_thread_launch_pinned(coreId, pollWorker, this);
-  if (rc < 0) {
-    printf("Launch poll worker failed\n");
   }
 }
 
@@ -393,4 +374,66 @@ void Device::AddAvailableZone(Zone *zone)
 uint32_t Device::GetNumZones()
 {
   return mNumZones;
+}
+
+std::map<uint64_t, std::pair<uint32_t, uint8_t*>> Device::ReadZoneHeaders()
+{
+//  bool done = false;
+//  auto complete = [](void *arg, const struct spdk_nvme_cpl *completion) {
+//    bool *done = (bool*)arg;
+//    *done = true;
+//  }
+//
+//  std::map<uint64_t, <uint32_t, uint8_t*>> zones;
+//
+//  // Read zone report
+//  struct spdk_nvme_zns_zone_report *report;
+//  uint32_t report_bytes = sizeof(report->descs[0]) * mNumZones + sizeof(*report);
+//  report = (struct spdk_nvme_zns_zone_report *)calloc(1, report_bytes);
+//  spdk_nvme_zns_report_zones(mNamespace, mIoQueues[0], &states, 4096, 0,
+//                             SPDK_NVME_ZRA_LIST_ALL, false, complete, &done);
+//  while (!done) ;
+//
+//  for (uint32_t i = 0; i < report->nr_zones; ++i) {
+//    struct spdk_nvme_zns_desc *zdesc = &report->descs[i];
+//    uint32_t wp = ~0u;
+//    zslbaAndWp.first = zdesc->zslba;
+//
+//    if (zdesc->zs == SPDK_NVME_ZONE_STATE_FULL) {
+//      // This zone belongs to a sealed segment
+//      wp = ~0ull;
+//    } else if (zdesc->zs == SPDK_NVME_ZONE_STATE_IOPEN 
+//               || zdesc->zs == ZONE_STATE_EOPEN) {
+//      wp = zdesc->wp;
+//    } else {
+//      continue;
+//    }
+//    uint8_t *buffer = spdk_zmalloc(Configuration::GetBlockSize(), 4096,
+//                                   NULL, SPDK_ENV_SOCKET_ID_ANY,
+//                                   SPDK_MALLOC_DMA);
+//    zones[zdesc->zslba] = std::make_pair(wp, buffer);
+//  }
+//
+//  // Read zone headers
+//  for (auto z : sealedZones) {
+//    done = false;
+//    uint64_t zslba = z.first;
+//    uint32_t *buffer = z.second;
+//    spdk_nvme_ns_cmd_read(mNamespace, mIoQueues[0],
+//                          buffer, zslba, 1,
+//                          complete, &done, 0);
+//    while (!done);
+//  }
+//
+//  for (auto z : openZones) {
+//    done = false;
+//    uint64_t zslba = z.first.first;
+//    uint32_t *buffer = z.second;
+//    spdk_nvme_ns_cmd_read(mNamespace, mIoQueues[0],
+//                          buffer, zslba, 1,
+//                          complete, &done, 0);
+//    while (!done);
+//  }
+
+//  return zones;
 }

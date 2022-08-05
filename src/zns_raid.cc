@@ -1,6 +1,6 @@
 #include "raid_controller.h"
 
-extern "C" void *zns_raid_create(void)
+extern "C" void* zns_raid_create(void)
 {
   RAIDController *ctrl = new RAIDController();
   ctrl->Init(false);
@@ -31,10 +31,13 @@ extern "C" void zns_raid_set_system_mode(int mode)
   Configuration::SetSystemMode(SystemMode(mode));
 }
 
-extern "C" void zns_raid_set_raid_mode(int n_data_blocks, int n_parity_blocks)
+extern "C" void zns_raid_set_raid_parameters(int n_data_blocks,
+                                             int n_parity_blocks,
+                                             int raid_level)
 {
   Configuration::SetStripeDataSize(Configuration::GetBlockSize() * n_data_blocks);
   Configuration::SetStripeParitySize(Configuration::GetBlockSize() * n_parity_blocks);
+  Configuration::SetRaidLevel((RAIDLevel)raid_level);
 }
 
 extern "C" void zns_raid_set_gc(bool enable)
@@ -49,3 +52,12 @@ extern "C" void zns_raid_set_sync_group_size(uint32_t group_size) {
 extern "C" void zns_raid_set_degraded_read(bool enable) {
   Configuration::SetEnableDegradedRead(enable);
 }
+
+extern "C" void zns_raid_set_num_open_segments(uint32_t num_open_segments) {
+  Configuration::SetNumOpenSegments(num_open_segments);
+}
+
+extern "C" void zns_raid_set_header_footer(uint32_t enable_header_footer) {
+  Configuration::SetEnableHeaderFooter(enable_header_footer);
+}
+

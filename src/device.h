@@ -4,7 +4,8 @@
 #include "spdk/nvme.h"
 #include "spdk/nvme_zns.h"
 #include "common.h"
-#include <map>
+#include <unordered_map>
+#include <deque>
 #include <vector>
 
 class Zone;
@@ -12,26 +13,31 @@ class Device {
 public:
   void Init(struct spdk_nvme_ctrlr *ctrlr, int nsid);
   void InitZones();
-
+  void EraseWholeDevice();
   void ConnectIoPairs();
-  void Write(uint64_t offset, uint32_t size, void *ctx);
-  void Append(uint64_t offset, uint32_t size, void *ctx);
-  void Read(uint64_t offset, uint32_t size, void *ctx);
 
-  Zone* OpenZone();
-  void AddAvailableZone(Zone *zone);
+  // I/O operations
+  void Write(uint64_t offset, uint32_t size, void *ctx); // zone write
+  void Append(uint64_t offset, uint32_t size, void *ctx); // zone append
+  void Read(uint64_t offset, uint32_t size, void *ctx); // zone read
+
+  // admin commands
   void ResetZone(Zone *zone, void *ctx);
-  void FinishZone(Zone *zone, void *ctx);
+  void FinishZone(Zone *zone, void *ctx); // seal
+  Zone* OpenZone();
+
+  void AddAvailableZone(Zone *zone);
+
   void SetDeviceId(uint32_t deviceId) { mDeviceId = deviceId; }
   uint32_t GetDeviceId() { return mDeviceId; }
+
   struct spdk_nvme_ctrlr* GetController() { return mController; }
   struct spdk_nvme_ns* GetNamespace() { return mNamespace; }
   struct spdk_nvme_qpair** GetIoQueues() { return mIoQueues; }
 
-  struct spdk_thread *GetPollThread() { return mPollThread; }
-  void StartPolling(int coreId);
   uint32_t GetNumZones();
 
+  std::map<uint64_t, std::pair<uint32_t, uint8_t*>> ReadZoneHeaders();
 
 private:
   uint64_t bytes2Block(uint64_t bytes);
@@ -50,7 +56,7 @@ private:
 
   struct spdk_thread *mPollThread;
 
-  std::map<int, Zone*> mUsedZones;
+  std::unordered_map<int, Zone*> mUsedZones;
   std::vector<Zone*> mAvailableZones;
   Zone* mZones;
 };

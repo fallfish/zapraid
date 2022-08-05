@@ -1,6 +1,7 @@
 #include "common.h"
 #include "segment.h"
 #include "raid_controller.h"
+#include "poller.h"
 #include <sys/time.h>
 #include <queue>
 
@@ -53,11 +54,11 @@ PhysicalAddr RequestContext::GetPba()
 
 void RequestContext::Queue()
 {
-  std::queue<RequestContext*>& q = ctrl->GetRequestQueue();
-  std::mutex& qMutex = ctrl->GetRequestQueueMutex();
-  qMutex.lock();
-  q.push(this);
-  qMutex.unlock();
+  struct spdk_thread *th = ctrl->GetDispatchThread();
+  if (spdk_thread_send_msg(th, handleEventsCompletionsOneEvent, this) < 0) {
+    printf("Failed!\n");
+    exit(-1);
+  }
 }
 
 void RequestContext::PrintStats()
@@ -67,9 +68,15 @@ void RequestContext::PrintStats()
 
 double timestamp()
 {
-  struct timeval s;
-  gettimeofday(&s, NULL);
-  return s.tv_sec + s.tv_usec / 1000000.0;
+  return 0;
+  // struct timeval s;
+  // gettimeofday(&s, NULL);
+  // return s.tv_sec + s.tv_usec / 1000000.0;
+}
+
+double gettimediff(struct timeval s, struct timeval e)
+{
+  return e.tv_sec + e.tv_usec / 1000000. - (s.tv_sec + s.tv_usec / 1000000.);
 }
 
 void RequestContext::CopyFrom(const RequestContext &o) {

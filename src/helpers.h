@@ -1,3 +1,5 @@
+#ifndef __NAMELESS_RAID_HELPER__
+#define __NAMELESS_RAID_HELPER__
 struct DrainArgs {
   RAIDController *ctrl;
   bool success;
@@ -58,5 +60,37 @@ void tryAppendToSegment(void *args)
 void enqueueRequest(void *args)
 {
   RequestContext *ctx = (RequestContext*)args;
-  ctx->ctrl->EnqueueEvent(ctx);
+  if (ctx->req_type == 'W') {
+    ctx->ctrl->WriteInDispatchThread(ctx);
+  } else {
+    ctx->ctrl->ReadInDispatchThread(ctx);
+  }
 }
+
+struct QueryPbaArgs {
+  RAIDController *ctrl;
+  RequestContext *ctx;
+};
+
+void queryPba(void *args) {
+  QueryPbaArgs *qArgs = (QueryPbaArgs*)args;
+  RAIDController *ctrl = qArgs->ctrl;
+  RequestContext *ctx = qArgs->ctx;
+  free(qArgs);
+
+  for (uint32_t i = 0; i < ctx->size / Configuration::GetBlockSize(); ++i) {
+    PhysicalAddr phyAddr;
+    uint64_t lba = ctx->lba + i * Configuration::GetBlockSize();
+    if (ctrl->LookupIndex(lba, &phyAddr)) {
+      ctx->pbaArray[i] = phyAddr;
+    } else {
+      ctx->pbaArray[i].segment = nullptr;
+    }
+  }
+  ctx->status = READ_INDEX_READY;
+  if (spdk_thread_send_msg(ctrl->GetDispatchThread(), enqueueRequest, ctx) < 0) {
+    printf("Failed!\n");
+    exit(-1);
+  }
+}
+#endif // NAMELESS_RAID_HELPER

@@ -6,6 +6,7 @@
 #include <mutex>
 #include <vector>
 #include <map>
+#include <list>
 #include "spdk/nvme.h"
 #include "configuration.h"
 
@@ -39,7 +40,12 @@ public:
 
 enum ContextStatus {
   WRITE_REAPING,
+  WRITE_INDEX_UPDATING,
+  WRITE_INDEX_UPDATED,
   WRITE_COMPLETE,
+  READ_PREPARE,
+  READ_INDEX_QUERYING,
+  READ_INDEX_READY,
   READ_REAPING,
   READ_COMPLETE,
   DEGRADED_READ_REAPING,
@@ -61,8 +67,9 @@ enum ContextType
 
 struct StripeWriteContext {
   uint8_t **data;
-  uint8_t *metadata;
-  uint8_t *dataPool;
+  uint8_t **metadata;
+  uint8_t *dataBuffer;
+  uint8_t *metadataBuffer;
   std::vector<RequestContext*> ioContext;
   uint32_t targetBytes;
   uint32_t successBytes;
@@ -77,17 +84,24 @@ struct ReadContext {
 
 union BlockMetadata {
   struct {
-    uint64_t lba;
-    uint64_t timestamp;
-    uint8_t  stripeId;
-  } d;
+    struct
+    {
+      uint64_t lba;
+      uint64_t timestamp;
+    } protectedField;
+    struct
+    {
+      uint32_t stripeId;
+    } nonProtectedField;
+  } fields;
   uint8_t reserved[64];
 };
 
 struct RequestContext
 {
   // Each Context is pre-allocated with a buffer
-  uint8_t *buffer;
+  uint8_t *dataBuffer;
+  uint8_t *metadataBuffer;
   ContextType type;
   ContextStatus status;
 
@@ -118,6 +132,8 @@ struct RequestContext
   double stime;
   double ctime;
   uint64_t timestamp;
+
+  struct timeval timeA;
 
   // context during request process
   RequestContext* associatedRequest;
@@ -151,7 +167,7 @@ struct RequestContext
 };
 
 // Data is an array: index is offset, value is the stripe Id in the corresponding group
-struct SyncPoint {
+struct NamedMetadata {
   uint8_t *data;
   uint8_t *metadata;
   RequestContext slots[16];
@@ -195,7 +211,214 @@ struct IoThread {
   RAIDController *controller;
 };
 
+struct RequestContextPool {
+  RequestContext *contexts;
+  std::vector<RequestContext*> availableContexts;
+  uint32_t capacity;
+
+  RequestContextPool(uint32_t cap) {
+    capacity = cap;
+    contexts = new RequestContext[capacity];
+    for (uint32_t i = 0; i < capacity; ++i) {
+      contexts[i].Clear();
+      contexts[i].dataBuffer = (uint8_t *)spdk_zmalloc(
+          Configuration::GetBlockSize(), 4096,
+          NULL, SPDK_ENV_SOCKET_ID_ANY,
+          SPDK_MALLOC_DMA);
+      contexts[i].metadataBuffer = (uint8_t *)spdk_zmalloc(
+          Configuration::GetMetadataSize(),
+          Configuration::GetMetadataSize(),
+          NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+      availableContexts.emplace_back(&contexts[i]);
+    }
+  }
+
+  RequestContext *getRequestContext(bool force) {
+    RequestContext *ctx = nullptr;
+    if (availableContexts.empty() && force == false) {
+      ctx = nullptr;
+    } else {
+      if (!availableContexts.empty()) {
+        ctx = availableContexts.back();
+        availableContexts.pop_back();
+        ctx->Clear();
+        ctx->available = false;
+      } else {
+        ctx = new RequestContext();
+        ctx->dataBuffer = (uint8_t *)spdk_zmalloc(
+            Configuration::GetBlockSize(), 4096,
+            NULL, SPDK_ENV_SOCKET_ID_ANY,
+            SPDK_MALLOC_DMA);
+        ctx->metadataBuffer = (uint8_t *)spdk_zmalloc(
+            Configuration::GetMetadataSize(),
+            Configuration::GetMetadataSize(),
+            NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+        ctx->Clear();
+        ctx->available = false;
+        printf("Request Context runs out.\n");
+      }
+    }
+    return ctx;
+  }
+
+  void returnRequestContext(RequestContext *slot) {
+    assert(slot->available);
+    if (slot < contexts || slot >= contexts + capacity) {
+    // test whether the returned slot is pre-allocated
+      spdk_free(slot->dataBuffer);
+      spdk_free(slot->metadataBuffer);
+      delete slot;
+    } else {
+      assert(availableContexts.size() <= capacity);
+      availableContexts.emplace_back(slot);
+    }
+  }
+};
+
+
+struct ReadContextPool {
+  ReadContext *contexts;
+  std::vector<ReadContext*> availableContexts;
+  std::list<ReadContext*> inflightContexts;
+  RequestContextPool *requestPool;
+  uint32_t capacity;
+
+  ReadContextPool(uint32_t cap, RequestContextPool *rp) {
+    capacity = cap;
+    requestPool = rp;
+
+    contexts = new ReadContext[capacity];
+    for (uint32_t i = 0; i < capacity; ++i) {
+      contexts[i].data = new uint8_t *[Configuration::GetStripeSize() /
+                                       Configuration::GetBlockSize()];
+      contexts[i].metadata = (uint8_t*)spdk_zmalloc(
+          Configuration::GetStripeSize(), 4096,
+          NULL, SPDK_ENV_SOCKET_ID_ANY,
+          SPDK_MALLOC_DMA);
+      contexts[i].ioContext.clear();
+      availableContexts.emplace_back(&contexts[i]);
+    }
+  }
+
+  ReadContext* GetContext() {
+    while (availableContexts.empty()) {
+      Recycle();
+    }
+
+    ReadContext *context = availableContexts.back();
+    inflightContexts.emplace_back(context);
+    availableContexts.pop_back();
+
+    return context;
+  }
+
+  void Recycle() {
+    for (auto it = inflightContexts.begin();
+        it != inflightContexts.end();
+        ) {
+      if (checkReadAvailable(*it)) {
+        availableContexts.emplace_back(*it);
+        it = inflightContexts.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+private:
+  bool checkReadAvailable(ReadContext *readContext)
+  {
+    bool isAvailable = true;
+    for (auto ctx : readContext->ioContext) {
+      if (!ctx->available) {
+        isAvailable = false;
+      }
+    }
+    if (isAvailable) {
+      for (auto ctx : readContext->ioContext) {
+        requestPool->returnRequestContext(ctx);
+      }
+      readContext->ioContext.clear();
+    }
+    return isAvailable;
+  }
+};
+  
+struct StripeWriteContextPool {
+  uint32_t capacity;
+  struct StripeWriteContext *contexts;
+  std::vector<StripeWriteContext *> availableContexts;
+  std::list<StripeWriteContext *> inflightContexts;
+  struct RequestContextPool *rPool;
+
+  StripeWriteContextPool(uint32_t cap, struct RequestContextPool *rp) {
+    capacity = cap;
+    rPool = rp;
+
+    contexts = new StripeWriteContext[capacity];
+    availableContexts.clear();
+    inflightContexts.clear();
+    for (int i = 0; i < capacity; ++i) {
+      contexts[i].data = new uint8_t *[Configuration::GetStripeSize() /
+                                       Configuration::GetBlockSize()];
+      contexts[i].metadata = new uint8_t *[Configuration::GetStripeSize() /
+                                       Configuration::GetBlockSize()];
+      contexts[i].ioContext.clear();
+      availableContexts.emplace_back(&contexts[i]);
+    }
+  }
+
+  StripeWriteContext* GetContext() {
+    if (availableContexts.empty()) {
+      Recycle();
+      if (availableContexts.empty()) {
+        return nullptr;
+      }
+    }
+
+    StripeWriteContext *stripe = availableContexts.back();
+    inflightContexts.emplace_back(stripe);
+    availableContexts.pop_back();
+
+    return stripe;
+  }
+
+  void Recycle() {
+    for (auto it = inflightContexts.begin();
+        it != inflightContexts.end();
+        ) {
+      if (checkStripeAvailable(*it)) {
+        assert((*it)->ioContext.empty());
+        availableContexts.emplace_back(*it);
+        it = inflightContexts.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  bool NoInflightStripes() {
+    return inflightContexts.empty();
+  }
+private:
+  bool checkStripeAvailable(StripeWriteContext *stripe) {
+    bool isAvailable = true;
+
+    for (auto slot : stripe->ioContext) {
+      isAvailable = slot && slot->available ? isAvailable : false;
+    }
+
+    if (isAvailable) {
+      for (auto slot : stripe->ioContext) {
+        rPool->returnRequestContext(slot);
+      }
+      stripe->ioContext.clear();
+    }
+
+    return isAvailable;
+  }
+};
+
 double timestamp();
-static void b() {}
+double gettimediff(struct timeval s, struct timeval e);
 
 #endif

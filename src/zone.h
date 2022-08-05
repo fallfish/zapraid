@@ -6,7 +6,7 @@
 
 class Zone {
 public:
-  void Init(Device *device, uint64_t slba, uint64_t length);
+  void Init(Device *device, uint64_t slba, uint64_t capacity, uint64_t size);
   void Write(uint32_t offset, uint32_t size, void *ctx);
   void Read(uint32_t offset, uint32_t size, void *ctx);
   void Reset(void *ctx);
@@ -25,7 +25,8 @@ private:
   uint64_t offset2Bytes(uint64_t size);
   Device* mDevice;
   uint64_t mSlba; // in blocks
-  uint32_t mLength; // in blocks
+  uint32_t mCapacity; // in blocks
+  uint32_t mSize;
   uint32_t mPos; // in blocks
 };
 #endif

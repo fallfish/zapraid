@@ -17,4 +17,7 @@ void zns_raid_set_gc(bool enable);
 void zns_raid_set_sync_group_size(uint32_t group_size);
 void zns_raid_set_degraded_read(bool enable);
 
+void zns_raid_set_num_open_segments(uint32_t num_open_segments);
+void zns_raid_set_header_footer(uint32_t enable_header_footer);
+
 #endif

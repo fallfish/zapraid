@@ -8,18 +8,22 @@ inline uint64_t Zone::offset2Bytes(uint64_t offset)
   return (mSlba << 12) + offset * Configuration::GetBlockSize();
 }
 
-void Zone::Init(Device* device, uint64_t slba, uint64_t length)
+void Zone::Init(Device* device, uint64_t slba, uint64_t capacity, uint64_t size)
 {
   mDevice = device;
   mSlba = slba;
-  mLength = length;
+  mCapacity = capacity;
+  mSize = size;
 }
 
 void Zone::Write(uint32_t offset, uint32_t size, void *ctx)
 {
-  if (((RequestContext*)ctx)->append) {
+  RequestContext *reqCtx = (RequestContext*)ctx;
+  if (reqCtx->append) {
+    reqCtx->offset = mSize - 1;
     mDevice->Append(offset2Bytes(0), size, ctx);
   } else {
+    reqCtx->offset = offset;
     mDevice->Write(offset2Bytes(offset), size, ctx);
   }
 }
@@ -66,13 +70,13 @@ uint32_t Zone::GetSlba()
 
 uint32_t Zone::GetLength()
 {
-  return mLength;
+  return mCapacity;
 }
 
 void Zone::PrintStats()
 {
   printf("device id: %d, slba: %d, length: %d\n",
-      GetDeviceId(), mSlba, mLength);
+      GetDeviceId(), mSlba, mCapacity);
 }
 
 void Zone::Release()

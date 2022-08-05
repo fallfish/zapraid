@@ -1,11 +1,17 @@
 enum SystemMode {
-  PURE_WRITE, PURE_ZONE_APPEND,
-  ZNS_RAID_NO_META, ZNS_RAID_WITH_META,
-  ZNS_RAID_WITH_REDIRECTION
+  NAMED_WRITE, NAMELESS_WRITE,
+  NAMED_GROUP, NAMED_META, REDIRECTION
 };
 
-enum RAIDScheme {
+enum RAIDLevel {
   RAID0, RAID1, RAID4, RAID5, RAID6
+};
+
+const static int raid6_4drive_mapping[4][4] = {
+  {0, 1, 2, 3},
+  {0, 2, 3, 1},
+  {2, 3, 0, 1},
+  {3, 0, 1, 2}
 };
 
 const static int raid6_5drive_mapping[5][5] = {
@@ -131,11 +137,40 @@ public:
     return GetInstance().gEnableDegradedRead;
   }
 
-  static RAIDScheme GetRaidScheme() {
+  static void SetRaidLevel(RAIDLevel level) {
+    printf("Set raid level: %d\n", (int)level);
+    GetInstance().gRaidScheme = level;
+  }
+
+  static RAIDLevel GetRaidLevel() {
     return GetInstance().gRaidScheme;
   }
 
-  static uint32_t CalculateDiskId(uint32_t stripeId, uint32_t whichBlock, RAIDScheme raidScheme, uint32_t numDisks) {
+  static void SetNumOpenSegments(uint32_t num_open_segments) {
+    GetInstance().gNumOpenSegments = num_open_segments;
+  }
+
+  static int GetNumOpenSegments() {
+    return GetInstance().gNumOpenSegments;
+  }
+
+  static void SetEnableHeaderFooter(bool enable_header_footer) {
+    GetInstance().gEnableHeaderFooter = enable_header_footer;
+  }
+
+  static bool GetEnableHeaderFooter() {
+    return GetInstance().gEnableHeaderFooter;
+  }
+
+  static bool GetBypassDevice() {
+    return false;
+  }
+
+  static bool GetIsBrandNew() {
+    return GetInstance().gIsBrandNew;
+  }
+
+  static uint32_t CalculateDiskId(uint32_t stripeId, uint32_t whichBlock, RAIDLevel raidScheme, uint32_t numDisks) {
     Configuration& conf = GetInstance();
     // calculate which disk current block (data/parity) should go
     uint32_t driveId = ~0u;
@@ -154,6 +189,8 @@ public:
       } else {
         driveId = whichBlock;
       }
+    } else if (raidScheme == RAID6 && numDisks == 4) {
+      driveId = raid6_4drive_mapping[stripeId % numDisks][whichBlock];
     } else if (raidScheme == RAID6 && numDisks == 5) {
       // A1 A2 A3 P1 P2
       // B1 B2 P1 P2 B3
@@ -162,33 +199,40 @@ public:
       // P2 E1 E2 E3 P1
       // ...
       driveId = raid6_5drive_mapping[stripeId % numDisks][whichBlock];
-    } else if (raidScheme == RAID6 && numDisks == 6) {
+    }
+    else if (raidScheme == RAID6 && numDisks == 6)
+    {
       driveId = raid6_6drive_mapping[stripeId % numDisks][whichBlock];
-    } else {
+    }
+    else
+    {
       fprintf(stderr, "RAID scheme not supported!\n");
     }
     return driveId;
   }
 
 private:
-  int gStripeSize = 4096 * 3;
-  int gStripeDataSize = 4096 * 2;
+  bool gIsBrandNew = true;
+
+  int gStripeSize = 4096 * 4;
+  int gStripeDataSize = 4096 * 3;
   int gStripeParitySize = 4096 * 1;
   int gStripeUnitSize = 4096 * 1;
   int gStripeBlockSize = 4096;
   int gBlockSize = 4096;
   int gMetadataSize = 64;
-  int gNumIoThreads = 3;
-  bool gDeviceSupportMetadata = false;
+  int gNumIoThreads = 1;
+  bool gDeviceSupportMetadata = true;
   int gZoneCapacity = 0;
   int gStripePersistencyMode = 0;
   bool gEnableGc = false;
-  int gSyncGroupSize = 8;
-  bool gEnableDegradedRead = true;
-  RAIDScheme gRaidScheme = RAID5;
+  int gSyncGroupSize = 512;
+  bool gEnableDegradedRead = false;
+  uint32_t gNumOpenSegments = 1;
+  RAIDLevel gRaidScheme = RAID5;
+  bool gEnableHeaderFooter = true;
 
-  SystemMode gSystemMode = PURE_WRITE;
+  SystemMode gSystemMode = NAMED_WRITE;
   // 0: Pure write; 1: Pure zone append; 2: Zone append without metadata; 3: Zone append with metadata; 4: Zone append with redirection
-
 };
 
