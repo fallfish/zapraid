@@ -166,8 +166,32 @@ public:
     return false;
   }
 
+  static bool GetEventFrameworkEnabled() {
+    return false;
+  }
+
   static bool GetIsBrandNew() {
     return GetInstance().gIsBrandNew;
+  }
+
+  static bool GetEcThreadCoreId() {
+    return GetInstance().gEcThreadCoreId;
+  }
+
+  static bool GetIndexThreadCoreId() {
+    return GetInstance().gIndexThreadCoreId;
+  }
+
+  static bool GetDispatchThreadCoreId() {
+    return GetInstance().gDispatchThreadCoreId;
+  }
+
+  static bool GetCompletionThreadCoreId() {
+    return GetInstance().gCompletionThreadCoreId;
+  }
+
+  static bool GetIoThreadCoreId(uint32_t thread_id) {
+    return GetInstance().gIoThreadCoreIdBase + thread_id;
   }
 
   static uint32_t CalculateDiskId(uint32_t stripeId, uint32_t whichBlock, RAIDLevel raidScheme, uint32_t numDisks) {
@@ -234,5 +258,11 @@ private:
 
   SystemMode gSystemMode = NAMED_WRITE;
   // 0: Pure write; 1: Pure zone append; 2: Zone append without metadata; 3: Zone append with metadata; 4: Zone append with redirection
+
+  uint32_t gEcThreadCoreId = 1;
+  uint32_t gIndexThreadCoreId = 2;
+  uint32_t gDispatchThreadCoreId = 3;
+  uint32_t gCompletionThreadCoreId = 4;
+  uint32_t gIoThreadCoreIdBase = 5;
 };
 

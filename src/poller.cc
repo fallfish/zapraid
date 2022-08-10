@@ -8,26 +8,29 @@
 #include "raid_controller.h"
 #include <sys/time.h>
 
-struct UpdatePbaArgs {
-  RAIDController *ctrl;
-  RequestContext *ctx;
-};
-
-void updatePba(void *args) {
-  UpdatePbaArgs *qArgs = (UpdatePbaArgs*)args;
-  RequestContext *ctx = qArgs->ctx;
-  assert(ctx->status == WRITE_INDEX_UPDATING);
+void updatePba2(void *arg1, void *arg2)
+{
+  RAIDController *ctrl = reinterpret_cast<RAIDController*>(arg1);
+  RequestContext *ctx = reinterpret_cast<RequestContext*>(arg2);
   for (uint32_t i = 0; i < ctx->size / Configuration::GetBlockSize(); ++i) {
     uint64_t lba = ctx->lba + i * Configuration::GetBlockSize();
-    qArgs->ctrl->UpdateIndex(lba, ctx->pbaArray[i]);
+    ctrl->UpdateIndex(lba, ctx->pbaArray[i]);
   }
-  free(qArgs);
   ctx->status = WRITE_COMPLETE;
   if (ctx->cb_fn != nullptr) {
     ctx->cb_fn(ctx->cb_args);
   }
   ctx->available = true;
-  // ctx->Queue();
+}
+
+void updatePba(void *args) {
+  UpdatePbaArgs *qArgs = reinterpret_cast<UpdatePbaArgs*>args;
+  RAIDController *ctrl = qArgs->ctrl;
+  RequestContext *ctx = qArgs->ctx;
+  free(qArgs);
+
+  assert(ctx->status == WRITE_INDEX_UPDATING);
+  updatePba2(ctrl, ctx);
 }
 
 static void dummy_disconnect_handler(struct spdk_nvme_qpair *qpair, void *poll_group_ctx)
@@ -62,13 +65,15 @@ static void handleUserContext(RequestContext *context)
   ContextStatus &status = context->status;
   assert(contextReady(context));
   if (status == WRITE_REAPING) {
-    UpdatePbaArgs *args = (UpdatePbaArgs*)calloc(1, sizeof(UpdatePbaArgs));
-    args->ctrl = context->ctrl;
-    args->ctx = context;
     status = WRITE_INDEX_UPDATING;
-    if (spdk_thread_send_msg(args->ctrl->GetIndexThread(), updatePba, args) < 0) {
-      printf("Failed!\n");
-      exit(-1);
+    if (!Configuration::GetEventFrameworkEnabled()) {
+      UpdatePbaArgs *args = (UpdatePbaArgs*)calloc(1, sizeof(UpdatePbaArgs));
+      args->ctrl = context->ctrl;
+      args->ctx = context;
+      thread_send_msg(args->ctrl->GetIndexThread(), updatePba, args);
+    } else {
+      event_call(Configuration::GetIndexThreadCoreId(),
+                 updatePba2, context->ctrl, context);
     }
   } else if (status == READ_REAPING) {
     status = READ_COMPLETE;
@@ -195,16 +200,6 @@ static void handleStripeUnitContext(RequestContext *context)
 
 void handleContext(RequestContext *context)
 {
-//  if (context->associatedRequest != nullptr) {
-//    RequestContext *ctx = context->associatedRequest;
-//    struct timeval b;
-//    gettimeofday(&b, NULL);
-//    double diff = gettimediff(ctx->timeA, b);
-//    if (diff > 0.000010)
-//    {
-//      printf("Time exceed %p, PointB: %f\n", ctx, diff);
-//    }
-//  }
   ContextType type = context->type;
   if (type == USER) {
     handleUserContext(context);
@@ -239,10 +234,14 @@ int handleEventsCompletion(void *args)
 }
 
 
-void handleEventsCompletionsOneEvent(void *args)
+void handleEventCompletion2(void *arg1, void *arg2)
 {
-  RequestContext *slot = (RequestContext*)args;
+  RequestContext *slot = (RequestContext*)arg1;
   handleContext(slot);
+}
+void handleEventCompletion(void *args)
+{
+  handleEventCompletion2(args, nullptr);
 }
 
 int handleEventsDispatch(void *args)
@@ -313,4 +312,200 @@ int completionWorker(void *args) {
   while (true) {
     spdk_thread_poll(thread, 0, 0);
   }
+}
+
+void registerIoCompletionRoutine(void *arg1, void *arg2)
+{
+  IoThread *ioThread = (IoThread*)arg1;
+  spdk_poller_register(handleIoCompletions, ioThread->group, 0);
+}
+
+void registerDispatchRoutine(void *arg1, void *arg2)
+{
+  RAIDController *raidController = reinterpret_cast<RAIDController*>(arg1);
+  spdk_poller_register(handleEventsDispatch, raidController, 0);
+  spdk_poller_register(handleBackgroundTasks, raidController, 1);
+}
+
+void enqueueRequest2(void *arg1, void *arg2)
+{
+  RequestContext *ctx = reinterpret_cast<RequestContext*>(arg1);
+  if (ctx->req_type == 'W') {
+    ctx->ctrl->WriteInDispatchThread(ctx);
+  } else {
+    ctx->ctrl->ReadInDispatchThread(ctx);
+  }
+}
+
+void enqueueRequest(void *args)
+{
+  enqueueRequest2(args, nullptr);
+}
+
+void queryPba2(void *arg1, void *arg2)
+{
+  RAIDController *ctrl = reinterpret_cast<RAIDController*>(arg1);
+  RequestContext *ctx = reinterpret_cast<RequestContext*>(arg2);
+  for (uint32_t i = 0; i < ctx->size / Configuration::GetBlockSize(); ++i) {
+    PhysicalAddr phyAddr;
+    uint64_t lba = ctx->lba + i * Configuration::GetBlockSize();
+    if (ctrl->LookupIndex(lba, &phyAddr)) {
+      ctx->pbaArray[i] = phyAddr;
+    } else {
+      ctx->pbaArray[i].segment = nullptr;
+    }
+  }
+  ctx->status = READ_INDEX_READY;
+
+  if (!Configuration::GetEventFrameworkEnabled()) {
+    thread_send_msg(ctrl->GetDispatchThread(), enqueueRequest, ctx);
+  } else {
+    event_call(Configuration::GetDispatchThreadCoreId(),
+               enqueueRequest2, ctx, nullptr);
+  }
+}
+
+void queryPba(void *args)
+{
+  QueryPbaArgs *qArgs = (QueryPbaArgs*)args;
+  RAIDController *ctrl = qArgs->ctrl;
+  RequestContext *ctx = qArgs->ctx;
+  free(qArgs);
+
+  queryPba2(ctrl, ctx);
+}
+
+void zoneWrite2(void *arg1, void *arg2)
+{
+  RequestContext *slot = reinterpret_cast<RequestContext*>(arg1);
+  auto ioCtx = slot->ioContext;
+  slot->stime = timestamp();
+  int rc = 0;
+  if (Configuration::GetDeviceSupportMetadata()) {
+    rc = spdk_nvme_ns_cmd_write_with_md(ioCtx.ns, ioCtx.qpair,
+                                  ioCtx.data, ioCtx.metadata,
+                                  ioCtx.offset, ioCtx.size,
+                                  ioCtx.cb, ioCtx.ctx,
+                                  ioCtx.flags, 0, 0);
+  } else {
+    rc = spdk_nvme_ns_cmd_write(ioCtx.ns, ioCtx.qpair,
+                                  ioCtx.data, ioCtx.offset, ioCtx.size,
+                                  ioCtx.cb, ioCtx.ctx,
+                                  ioCtx.flags);
+  }
+  if (rc != 0) {
+    fprintf(stderr, "Device write error!\n");
+    printf("%d %ld %d %s\n", rc, ioCtx.offset, errno, strerror(errno));
+  }
+  assert(rc == 0);
+}
+
+void zoneWrite(void *args)
+{
+  zoneWrite2(args, nullptr);
+}
+
+void zoneRead2(void *arg1, void *arg2)
+{
+  RequestContext *slot = reinterpret_cast<RequestContext*>(arg1);
+  auto ioCtx = slot->ioContext;
+  slot->stime = timestamp();
+  int rc = 0;
+  if (Configuration::GetDeviceSupportMetadata()) {
+    rc = spdk_nvme_ns_cmd_read_with_md(ioCtx.ns, ioCtx.qpair,
+                                  ioCtx.data, ioCtx.metadata,
+                                  ioCtx.offset, ioCtx.size,
+                                  ioCtx.cb, ioCtx.ctx,
+                                  ioCtx.flags, 0, 0);
+  } else {
+    rc = spdk_nvme_ns_cmd_read(ioCtx.ns, ioCtx.qpair,
+                                  ioCtx.data, ioCtx.offset, ioCtx.size,
+                                  ioCtx.cb, ioCtx.ctx,
+                                  ioCtx.flags);
+  }
+  if (rc != 0) {
+    fprintf(stderr, "Device read error!\n");
+    printf("%d %d %d %s\n", rc, ioCtx.offset, errno, strerror(errno));
+  }
+  assert(rc == 0);
+}
+
+void zoneRead(void *args)
+{
+  zoneRead2(args, nullptr);
+}
+
+void zoneAppend2(void *arg1, void *arg2)
+{
+  RequestContext *slot = reinterpret_cast<RequestContext*>(arg1);
+  auto ioCtx = slot->ioContext;
+  slot->stime = timestamp();
+
+  int rc = 0;
+  if (Configuration::GetDeviceSupportMetadata()) {
+    rc = spdk_nvme_zns_zone_append_with_md(ioCtx.ns, ioCtx.qpair,
+                                  ioCtx.data, ioCtx.metadata,
+                                  ioCtx.offset, ioCtx.size,
+                                  ioCtx.cb, ioCtx.ctx,
+                                  ioCtx.flags, 0, 0);
+  } else {
+    rc = spdk_nvme_zns_zone_append(ioCtx.ns, ioCtx.qpair,
+                                      ioCtx.data, ioCtx.offset, ioCtx.size,
+                                      ioCtx.cb, ioCtx.ctx,
+                                      ioCtx.flags);
+  }
+  if (rc != 0) {
+    fprintf(stderr, "Device append error!\n");
+  }
+  assert(rc == 0);
+}
+
+void zoneAppend(void *args)
+{
+  zoneAppend2(args, nullptr);
+}
+
+void zoneReset2(void *arg1, void *arg2)
+{
+  RequestContext *slot = reinterpret_cast<RequestContext*>(arg1);
+  auto ioCtx = slot->ioContext;
+  slot->stime = timestamp();
+  int rc = spdk_nvme_zns_reset_zone(ioCtx.ns, ioCtx.qpair, ioCtx.offset, 0, ioCtx.cb, ioCtx.ctx);
+  if (rc != 0) {
+    fprintf(stderr, "Device reset error!\n");
+  }
+  assert(rc == 0);
+}
+
+void zoneReset(void *args)
+{
+  zoneReset2(args, nullptr);
+}
+
+void zoneFinish2(void *arg1, void *arg2)
+{
+  RequestContext *slot = reinterpret_cast<RequestContext*>(arg1);
+  auto ioCtx = slot->ioContext;
+  slot->stime = timestamp();
+
+  int rc = spdk_nvme_zns_finish_zone(ioCtx.ns, ioCtx.qpair, ioCtx.offset, 0, ioCtx.cb, ioCtx.ctx);
+  if (rc != 0) {
+    fprintf(stderr, "Device close error!\n");
+  }
+  assert(rc == 0);
+}
+
+void zoneFinish(void *args)
+{
+  zoneFinish2(args, nullptr);
+}
+
+void tryDrainController(void *args)
+{
+  DrainArgs *drainArgs = (DrainArgs *)args;
+  drainArgs->ctrl->ReclaimContexts();
+  drainArgs->ctrl->ProceedGc();
+  drainArgs->success = drainArgs->ctrl->GetNumInflightRequests() == 0 && !drainArgs->ctrl->ExistsGc();
+
+  drainArgs->ready = true;
 }

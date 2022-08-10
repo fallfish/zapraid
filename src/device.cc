@@ -8,6 +8,7 @@
 
 #include "spdk/nvme.h"
 
+// callbacks for io completions
 static void writeComplete(void *arg, const struct spdk_nvme_cpl *completion)
 {
   RequestContext *slot = (RequestContext*)arg;
@@ -75,105 +76,6 @@ static void appendComplete(void *arg, const struct spdk_nvme_cpl *completion)
     exit(1);
   }
 };
-
-static void write(void *args)
-{
-  RequestContext *slot = (RequestContext*)args;
-  auto ioCtx = slot->ioContext;
-  slot->stime = timestamp();
-  int rc = 0;
-  if (Configuration::GetDeviceSupportMetadata()) {
-    rc = spdk_nvme_ns_cmd_write_with_md(ioCtx.ns, ioCtx.qpair,
-                                  ioCtx.data, ioCtx.metadata,
-                                  ioCtx.offset, ioCtx.size,
-                                  ioCtx.cb, ioCtx.ctx,
-                                  ioCtx.flags, 0, 0);
-  } else {
-    rc = spdk_nvme_ns_cmd_write(ioCtx.ns, ioCtx.qpair,
-                                  ioCtx.data, ioCtx.offset, ioCtx.size,
-                                  ioCtx.cb, ioCtx.ctx,
-                                  ioCtx.flags);
-  }
-  if (rc != 0) {
-    fprintf(stderr, "Device write error!\n");
-    printf("%d %ld %d %s\n", rc, ioCtx.offset, errno, strerror(errno));
-  }
-  assert(rc == 0);
-}
-
-static void read(void *args)
-{
-  RequestContext *slot = (RequestContext*)args;
-  auto ioCtx = slot->ioContext;
-  slot->stime = timestamp();
-  int rc = 0;
-  if (Configuration::GetDeviceSupportMetadata()) {
-    rc = spdk_nvme_ns_cmd_read_with_md(ioCtx.ns, ioCtx.qpair,
-                                  ioCtx.data, ioCtx.metadata,
-                                  ioCtx.offset, ioCtx.size,
-                                  ioCtx.cb, ioCtx.ctx,
-                                  ioCtx.flags, 0, 0);
-  } else {
-    rc = spdk_nvme_ns_cmd_read(ioCtx.ns, ioCtx.qpair,
-                                  ioCtx.data, ioCtx.offset, ioCtx.size,
-                                  ioCtx.cb, ioCtx.ctx,
-                                  ioCtx.flags);
-  }
-  if (rc != 0) {
-    fprintf(stderr, "Device read error!\n");
-    printf("%d %d %d %s\n", rc, ioCtx.offset, errno, strerror(errno));
-  }
-  assert(rc == 0);
-}
-
-static void append(void *args)
-{
-  RequestContext *slot = (RequestContext*)args;
-  auto ioCtx = slot->ioContext;
-  slot->stime = timestamp();
-
-  int rc = 0;
-  if (Configuration::GetDeviceSupportMetadata()) {
-    rc = spdk_nvme_zns_zone_append_with_md(ioCtx.ns, ioCtx.qpair,
-                                  ioCtx.data, ioCtx.metadata,
-                                  ioCtx.offset, ioCtx.size,
-                                  ioCtx.cb, ioCtx.ctx,
-                                  ioCtx.flags, 0, 0);
-  } else {
-    rc = spdk_nvme_zns_zone_append(ioCtx.ns, ioCtx.qpair,
-                                      ioCtx.data, ioCtx.offset, ioCtx.size,
-                                      ioCtx.cb, ioCtx.ctx,
-                                      ioCtx.flags);
-  }
-  if (rc != 0) {
-    fprintf(stderr, "Device append error!\n");
-  }
-  assert(rc == 0);
-}
-
-static void reset(void *args)
-{
-  auto ioCtx = ((RequestContext*)args)->ioContext;
-  ((RequestContext*)args)->stime = timestamp();
-  int rc = spdk_nvme_zns_reset_zone(ioCtx.ns, ioCtx.qpair, ioCtx.offset, 0, ioCtx.cb, ioCtx.ctx);
-  if (rc != 0) {
-    fprintf(stderr, "Device reset error!\n");
-  }
-  assert(rc == 0);
-}
-
-static void finish(void *args)
-{
-  RequestContext *slot = (RequestContext*)args;
-  auto ioCtx = slot->ioContext;
-  slot->stime = timestamp();
-
-  int rc = spdk_nvme_zns_finish_zone(ioCtx.ns, ioCtx.qpair, ioCtx.offset, 0, ioCtx.cb, ioCtx.ctx);
-  if (rc != 0) {
-    fprintf(stderr, "Device close error!\n");
-  }
-  assert(rc == 0);
-}
 
 inline uint64_t Device::bytes2Block(uint64_t bytes)
 {
@@ -252,6 +154,20 @@ Zone* Device::OpenZone()
   return zone;
 }
 
+void issueIo2(spdk_event_fn event_fn, RequestContext *slot)
+{
+  static uint32_t ioThreadId = 0;
+  event_call(Configuration::GetIoThreadCoreId(ioThreadId), event_fn, slot, nullptr);
+  ioThreadId = (ioThreadId + 1) % Configuration::GetNumIoThreads();
+}
+
+void issueIo(spdk_msg_fn msg_fn, RequestContext *slot)
+{
+  static uint32_t ioThreadId = 0;
+  thread_send_msg(slot->ctrl->GetIoThread(IoThread), msg_fn, slot);
+  ioThreadId = (ioThreadId + 1) % Configuration::GetNumIoThreads();
+}
+
 void Device::ResetZone(Zone* zone, void *ctx)
 {
   RequestContext *slot = (RequestContext*)ctx;
@@ -261,8 +177,11 @@ void Device::ResetZone(Zone* zone, void *ctx)
   slot->ioContext.ctx = ctx;
   slot->ioContext.offset = zone->GetSlba();
   slot->ioContext.flags = 0;
-  if (spdk_thread_send_msg(slot->ctrl->GetIoThread(0), reset, slot) < 0) {
-    printf("send %p failed, error %s\n", slot, rte_strerror(rte_errno));
+
+  if (Configuration::GetEventFrameworkEnabled()) {
+    issueIo2(zoneReset2);
+  } else {
+    issueIo(zoneReset);
   }
 
   mUsedZones.erase(zone->GetSlba());
@@ -284,8 +203,10 @@ void Device::FinishZone(Zone *zone, void *ctx)
     return;
   }
 
-  if (spdk_thread_send_msg(slot->ctrl->GetIoThread(0), finish, slot) < 0) {
-    printf("send %p failed, error %s\n", slot, rte_strerror(rte_errno));
+  if (Configuration::GetEventFrameworkEnabled()) {
+    issueIo2(zoneFinish2);
+  } else {
+    issueIo(zoneFinish);
   }
 }
 
@@ -308,15 +229,15 @@ void Device::Write(uint64_t offset, uint32_t size, void* ctx)
     return;
   }
 
-  if (spdk_thread_send_msg(slot->ctrl->GetIoThread(0), write, slot) < 0) {
-    printf("Size of slot: %lu\n", sizeof(*slot));
-    assert(0);
+  if (Configuration::GetEventFrameworkEnabled()) {
+    issueIo2(zoneWrite2);
+  } else {
+    issueIo(zoneWrite);
   }
 }
 
 void Device::Append(uint64_t offset, uint32_t size, void* ctx)
 {
-  static int curThread = 0; // gNumPollThreads - 1;
   RequestContext *slot = (RequestContext*)ctx;
   slot->ioContext.ns = mNamespace;
   slot->ioContext.qpair = mIoQueues[curThread];
@@ -335,11 +256,11 @@ void Device::Append(uint64_t offset, uint32_t size, void* ctx)
     return;
   }
 
-  if (spdk_thread_send_msg(slot->ctrl->GetIoThread(curThread), append, slot) < 0) {
-    printf("send %p failed, error %s\n", slot, rte_strerror(rte_errno));
-    assert(0);
-  } 
-  curThread = (curThread + 1) % Configuration::GetNumIoThreads();
+  if (Configuration::GetEventFrameworkEnabled()) {
+    issueIo2(zoneAppend2);
+  } else {
+    issueIo(zoneAppend);
+  }
 }
 
 void Device::Read(uint64_t offset, uint32_t size, void* ctx)
@@ -360,8 +281,11 @@ void Device::Read(uint64_t offset, uint32_t size, void* ctx)
     slot->Queue();
     return;
   }
-  if (spdk_thread_send_msg(slot->ctrl->GetIoThread(0), read, slot) < 0) {
-    printf("send %p failed, error %s\n", slot, rte_strerror(rte_errno));
+
+  if (Configuration::GetEventFrameworkEnabled()) {
+    issueIo2(zoneRead2);
+  } else {
+    issueIo(zoneRead);
   }
 }
 

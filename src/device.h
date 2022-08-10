@@ -54,8 +54,6 @@ private:
 
   uint32_t mDeviceId;
 
-  struct spdk_thread *mPollThread;
-
   std::unordered_map<int, Zone*> mUsedZones;
   std::vector<Zone*> mAvailableZones;
   Zone* mZones;

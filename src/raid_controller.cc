@@ -56,10 +56,10 @@ void RAIDController::initEcThread()
 {
   struct spdk_cpuset cpumask;
   spdk_cpuset_zero(&cpumask);
-  spdk_cpuset_set_cpu(&cpumask, mEcThreadCoreId, true);
+  spdk_cpuset_set_cpu(&cpumask, Configuration::GetEcThreadCoreId(), true);
   mEcThread = spdk_thread_create("ECThread", &cpumask);
   printf("Create EC processing thread %s %d\n", spdk_thread_get_name(mEcThread), spdk_thread_get_id(mEcThread));
-  int rc = spdk_env_thread_launch_pinned(mEcThreadCoreId, ecWorker, this);
+  int rc = spdk_env_thread_launch_pinned(Configuration::GetEcThreadCoreId(), ecWorker, this);
   if (rc < 0) {
     printf("Failed to launch ec thread error: %s\n", spdk_strerror(rc));
   }
@@ -69,12 +69,12 @@ void RAIDController::initIndexThread()
 {
   struct spdk_cpuset cpumask;
   spdk_cpuset_zero(&cpumask);
-  spdk_cpuset_set_cpu(&cpumask, mIndexThreadCoreId, true);
+  spdk_cpuset_set_cpu(&cpumask, Configuration::GetIndexThreadCoreId(), true);
   mIndexThread = spdk_thread_create("IndexThread", &cpumask);
   printf("Create index and completion thread %s %lu\n",
          spdk_thread_get_name(mIndexThread),
          spdk_thread_get_id(mIndexThread));
-  int rc = spdk_env_thread_launch_pinned(mIndexThreadCoreId, indexWorker, this);
+  int rc = spdk_env_thread_launch_pinned(Configuration::GetIndexThreadCoreId(), indexWorker, this);
   if (rc < 0) {
     printf("Failed to launch index completion thread, error: %s\n", spdk_strerror(rc));
   }
@@ -84,12 +84,12 @@ void RAIDController::initCompletionThread()
 {
   struct spdk_cpuset cpumask;
   spdk_cpuset_zero(&cpumask);
-  spdk_cpuset_set_cpu(&cpumask, mCompletionThreadCoreId, true);
+  spdk_cpuset_set_cpu(&cpumask, Configuration::GetCompletionThreadCoreId(), true);
   mCompletionThread = spdk_thread_create("CompletionThread", &cpumask);
   printf("Create index and completion thread %s %lu\n",
          spdk_thread_get_name(mCompletionThread),
          spdk_thread_get_id(mCompletionThread));
-  int rc = spdk_env_thread_launch_pinned(mCompletionThreadCoreId, completionWorker, this);
+  int rc = spdk_env_thread_launch_pinned(Configuration::GetCompletionThreadCoreId(), completionWorker, this);
   if (rc < 0) {
     printf("Failed to launch completion thread, error: %s\n", spdk_strerror(rc));
   }
@@ -99,12 +99,12 @@ void RAIDController::initDispatchThread()
 {
   struct spdk_cpuset cpumask;
   spdk_cpuset_zero(&cpumask);
-  spdk_cpuset_set_cpu(&cpumask, mDispatchThreadCoreId, true);
+  spdk_cpuset_set_cpu(&cpumask, Configuration::GetDispatchThreadCoreId(), true);
   mDispatchThread = spdk_thread_create("DispatchThread", &cpumask);
   printf("Create dispatch thread %s %lu\n",
          spdk_thread_get_name(mDispatchThread),
          spdk_thread_get_id(mDispatchThread));
-  int rc = spdk_env_thread_launch_pinned(mDispatchThreadCoreId, dispatchWorker, this);
+  int rc = spdk_env_thread_launch_pinned(Configuration::GetDispatchThreadCoreId(), dispatchWorker, this);
   if (rc < 0) {
     printf("Failed to launch dispatch thread error: %s %s\n", strerror(rc), spdk_strerror(rc));
   }
@@ -115,11 +115,11 @@ void RAIDController::initIoThread()
   struct spdk_cpuset cpumask;
   for (uint32_t threadId = 0; threadId < Configuration::GetNumIoThreads(); ++threadId) {
     spdk_cpuset_zero(&cpumask);
-    spdk_cpuset_set_cpu(&cpumask, threadId + mIoThreadCoreIdBase, true);
+    spdk_cpuset_set_cpu(&cpumask, threadId + Configuration::GetIoThreadCoreId(0), true);
     mIoThread[threadId].thread = spdk_thread_create("IoThread", &cpumask);
     assert(mIoThread[threadId].thread != nullptr);
     mIoThread[threadId].controller = this;
-    int rc = spdk_env_thread_launch_pinned(threadId + mIoThreadCoreIdBase, ioWorker, &mIoThread[threadId]);
+    int rc = spdk_env_thread_launch_pinned(threadId + Configuration::GetIoThreadCoreId(0), ioWorker, &mIoThread[threadId]);
     printf("ZNS_RAID io thread %s %lu\n", spdk_thread_get_name(mIoThread[threadId].thread), spdk_thread_get_id(mIoThread[threadId].thread));
     if (rc < 0) {
       printf("Failed to launch IO thread error: %s %s\n", strerror(rc), spdk_strerror(rc));
@@ -206,11 +206,22 @@ void RAIDController::Init(bool need_env)
 //    }
   }
 
-  initEcThread();
-  initDispatchThread();
-  initIndexThread();
-  initCompletionThread();
-  initIoThread(); // 4-6
+  if (Configuration::GetEventFrameworkEnabled()) {
+    event_call(Configuration::GetDispatchThreadCoreId(),
+               registerDispatchRoutine, this, nullptr);
+    for (uint32_t threadId = 0;
+         threadId < Configuration::GetNumIoThreads(); 
+         ++threadId) {
+      event_call(Configuration::GetCompletionThreadCoreId(threadId),
+                 registerIoCompletionRoutine, &mIoThread[threadId], nullptr);
+    }
+  } else {
+    initEcThread();
+    initDispatchThread();
+    initIndexThread();
+    initCompletionThread();
+    initIoThread();
+  }
 
   // Preallocate segments
   mNumOpenSegments = Configuration::GetNumOpenSegments();
@@ -244,27 +255,15 @@ RAIDController::~RAIDController()
     printf("Zone group: %p\n", segment);
 //    segment->Reset();
   }
-  for (uint32_t i = 0; i < Configuration::GetNumIoThreads(); ++i) {
-    if (spdk_thread_send_msg(mIoThread[i].thread, quit, nullptr) < 0) {
-      printf("Failed to quit io thread!\n");
-      exit(-1);
+
+  if (!Configuration::GetEventFrameworkEnabled()) {
+    for (uint32_t i = 0; i < Configuration::GetNumIoThreads(); ++i) {
+      thread_send_msg(mIoThread[i].thread, quit, nullptr);
     }
-  }
-  if (spdk_thread_send_msg(mDispatchThread, quit, nullptr) < 0) {
-    printf("Failed to quit dispatch thread!\n");
-    exit(-1);
-  }
-  if (spdk_thread_send_msg(mEcThread, quit, nullptr) < 0) {
-    printf("Failed to quit ec thread!\n");
-    exit(-1);
-  }
-  if (spdk_thread_send_msg(mIndexThread, quit, nullptr) < 0) {
-    printf("Failed to quit index thread!\n");
-    exit(-1);
-  }
-  if (spdk_thread_send_msg(mCompletionThread, quit, nullptr) < 0) {
-    printf("Failed to quit completion thread!\n");
-    exit(-1);
+    thread_send_msg(mDispatchThread, quit, nullptr);
+    thread_send_msg(mEcThread, quit, nullptr);
+    thread_send_msg(mIndexThread, quit, nullptr);
+    thread_send_msg(mCompletionThread, quit, nullptr);
   }
 }
 
@@ -383,9 +382,11 @@ void RAIDController::doExecute(
 
   // printf("PointA: %p\n", ctx);
 //  gettimeofday(&ctx->timeA, NULL);
-  if (spdk_thread_send_msg(mDispatchThread, enqueueRequest, ctx) < 0) {
-    printf("Failed!\n");
-    exit(-1);
+  if (!Configuration::GetEventFrameworkEnabled()) {
+    thread_send_msg(mDispatchThread, enqueueRequest, ctx);
+  } else {
+    event_call(Configuration::GetDispatchThreadCoreId(),
+               enqueueRequest2, ctx, nullptr);
   }
 
   return ;
@@ -470,13 +471,15 @@ void RAIDController::ReadInDispatchThread(RequestContext *ctx)
 
   if (ctx->status == READ_PREPARE) {
     ctx->status = READ_INDEX_QUERYING;
-    QueryPbaArgs *args = (QueryPbaArgs*)calloc(1, sizeof(QueryPbaArgs));
     ctx->pbaArray.resize(numBlocks);
-    args->ctrl = this;
-    args->ctx = ctx;
-    if (spdk_thread_send_msg(mIndexThread, queryPba, args) < 0) {
-      printf("Failed!\n");
-      exit(-1);
+    if (!Configuration::GetEventFrameworkEnabled()) {
+      QueryPbaArgs *args = (QueryPbaArgs *)calloc(1, sizeof(QueryPbaArgs));
+      args->ctrl = this;
+      args->ctx = ctx;
+      thread_send_msg(mIndexThread, queryPba, args);
+    } else {
+      event_call(Configuration::GetIndexThreadCoreId(),
+                 queryPba2, this, ctx);
     }
   } else if (ctx->status == READ_INDEX_READY) {
     ctx->status = READ_REAPING;
@@ -591,10 +594,7 @@ void RAIDController::Drain()
   args.success = false;
   while (!args.success) {
     args.ready = false;
-    if (spdk_thread_send_msg(mDispatchThread, tryDrainController, &args) < 0) {
-      printf("Failed!\n");
-      exit(-1);
-    }
+    thread_send_msg(mDispatchThread, tryDrainController, &args);
     busyWait(&args.ready);
   }
 }

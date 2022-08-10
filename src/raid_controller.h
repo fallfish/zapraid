@@ -101,6 +101,13 @@ public:
   struct spdk_thread *GetCompletionThread();
 
   /**
+   * @brief Get the Completion Thread object
+   * 
+   * @return struct spdk_thread* 
+   */
+  struct spdk_thread *GetCompletionThread();
+
+  /**
    * @brief Get the Events To Dispatch object
    * 
    * @return std::vector<RequestContext*>& 
@@ -117,6 +124,7 @@ public:
    */
   bool LookupIndex(uint64_t lba, PhysicalAddr *phyAddr);
   void ReclaimContexts();
+
 private:
   RequestContext* getContextForUserRequest();
   void doExecute(uint64_t offset, uint32_t size, void* data, bool is_write, zns_raid_request_complete cb_fn, void *cb_args);
@@ -167,11 +175,6 @@ private:
   struct spdk_thread *mEcThread;
   struct spdk_thread *mIndexThread;
   struct spdk_thread *mCompletionThread;
-  uint32_t mEcThreadCoreId = 1;
-  uint32_t mIndexThreadCoreId = 2;
-  uint32_t mDispatchThreadCoreId = 3;
-  uint32_t mCompletionThreadCoreId = 4;
-  uint32_t mIoThreadCoreIdBase = 5;
 
   int64_t mNumInvalidBlocks = 0;
   int64_t mNumBlocks = 0;

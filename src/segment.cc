@@ -186,9 +186,13 @@ SegmentStatus Segment::GetStatus()
   return mSegmentStatus;
 }
 
-void progressFooterWriter(void *args) {
- Segment *segment = (Segment*)args; 
+void progressFooterWriter2(void *arg1, void *arg2) {
+ Segment *segment = reinterpret_cast<Segment*>(arg1);
  segment->ProgressFooterWriter();
+}
+
+void progressFooterWriter(void *args) {
+  progressFooterWriter2(args, nullptr);
 }
 
 // StateTransition must be called in the same thread
@@ -284,7 +288,11 @@ bool Segment::StateTransition()
           RequestContext *slot = mCurStripe->ioContext[i];
           slot->available = false;
         }
-        spdk_thread_send_msg(mRaidController->GetEcThread(), progressFooterWriter, this);
+        if (!Configuration::GetEventFrameworkEnabled()) {
+          thread_send_msg(mRaidController->GetEcThread(), progressFooterWriter, this);
+        } else {
+          event_call(Configuration::GetEcThreadCoreId(), progressFooterWriter2, this, nullptr);
+        }
       }
     }
   } else if (mSegmentStatus == SEGMENT_SEALING) {
@@ -301,10 +309,15 @@ bool Segment::StateTransition()
   return stateChanged;
 }
 
-void finalizeSegmentHeader(void *args)
+void finalizeSegmentHeader2(void *arg1, void *arg2)
 {
   Segment *segment = reinterpret_cast<Segment*>(args);
   segment->FinalizeSegmentHeader();
+}
+
+void finalizeSegmentHeader(void *args)
+{
+  finalizeSegmentHeader2(args, nullptr);
 }
 
 void Segment::FinalizeCreation()
@@ -321,7 +334,12 @@ void Segment::FinalizeCreation()
     stripe->ioContext[i] = slot;
     slot->available = false;
   }
-  spdk_thread_send_msg(mRaidController->GetEcThread(), finalizeSegmentHeader, this);
+
+  if (!Configuration::GetEventFrameworkEnabled()) {
+    thread_send_msg(mRaidController->GetEcThread(), finalizeSegmentHeader, this);
+  } else {
+    event_call(Configuration::GetEcThreadCoreId(), finalizeSegmentHeader2, this, nullptr);
+  }
 }
 
 void Segment::FinalizeSegmentHeader()
@@ -423,11 +441,16 @@ struct GenerateParityBlockArgs {
   uint32_t zonePos;
 };
 
-void generateParityBlock(void *args)
+void generateParityBlock2(void *arg1, void *arg2)
 {
-  struct GenerateParityBlockArgs *gen_args = (struct GenerateParityBlockArgs*)args;
+  struct GenerateParityBlockArgs *gen_args = reinterpret_cast<struct GenerateParityBlockArgs*>(arg1);
   gen_args->segment->GenerateParityBlock(gen_args->stripe, gen_args->zonePos);
   free(gen_args);
+}
+
+void generateParityBlock(void *args)
+{
+  generateParityBlock2(args, nullptr);
 }
 
 
@@ -495,8 +518,11 @@ bool Segment::Append(RequestContext *ctx, uint32_t offset)
     args->segment = this;
     args->stripe = mCurStripe;
     args->zonePos = mZonePos;
-    if (spdk_thread_send_msg(mRaidController->GetEcThread(), generateParityBlock, args) < 0) {
-      exit(-1);
+
+    if (!Configuration::GetEventFrameworkEnabled()) {
+      thread_send_msg(mRaidController->GetEcThread(), generateParityBlock, args);
+    } else {
+      event_call(Configuration::GetEcThreadCoreId(), generateParityBlock2, args, nullptr);
     }
 
     mStripePos = 0;
