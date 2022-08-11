@@ -311,7 +311,7 @@ bool Segment::StateTransition()
 
 void finalizeSegmentHeader2(void *arg1, void *arg2)
 {
-  Segment *segment = reinterpret_cast<Segment*>(args);
+  Segment *segment = reinterpret_cast<Segment*>(arg1);
   segment->FinalizeSegmentHeader();
 }
 

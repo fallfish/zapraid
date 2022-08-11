@@ -19,6 +19,8 @@ struct QueryPbaArgs {
   RequestContext *ctx;
 };
 
+void tryDrainController(void *args);
+
 // Used under spdk thread library
 void handleEventCompletion(void *args);
 int ioWorker(void *args);

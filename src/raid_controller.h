@@ -98,8 +98,6 @@ public:
    */
   struct spdk_thread *GetIndexThread();
 
-  struct spdk_thread *GetCompletionThread();
-
   /**
    * @brief Get the Completion Thread object
    * 

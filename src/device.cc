@@ -154,34 +154,36 @@ Zone* Device::OpenZone()
   return zone;
 }
 
-void issueIo2(spdk_event_fn event_fn, RequestContext *slot)
+void Device::issueIo2(spdk_event_fn event_fn, RequestContext *slot)
 {
   static uint32_t ioThreadId = 0;
+  slot->ioContext.ns = mNamespace;
+  slot->ioContext.qpair = mIoQueues[ioThreadId];
   event_call(Configuration::GetIoThreadCoreId(ioThreadId), event_fn, slot, nullptr);
   ioThreadId = (ioThreadId + 1) % Configuration::GetNumIoThreads();
 }
 
-void issueIo(spdk_msg_fn msg_fn, RequestContext *slot)
+void Device::issueIo(spdk_msg_fn msg_fn, RequestContext *slot)
 {
   static uint32_t ioThreadId = 0;
-  thread_send_msg(slot->ctrl->GetIoThread(IoThread), msg_fn, slot);
+  slot->ioContext.ns = mNamespace;
+  slot->ioContext.qpair = mIoQueues[ioThreadId];
+  thread_send_msg(slot->ctrl->GetIoThread(ioThreadId), msg_fn, slot);
   ioThreadId = (ioThreadId + 1) % Configuration::GetNumIoThreads();
 }
 
 void Device::ResetZone(Zone* zone, void *ctx)
 {
   RequestContext *slot = (RequestContext*)ctx;
-  slot->ioContext.ns = mNamespace;
-  slot->ioContext.qpair = mIoQueues[0];
   slot->ioContext.cb = resetComplete;
   slot->ioContext.ctx = ctx;
   slot->ioContext.offset = zone->GetSlba();
   slot->ioContext.flags = 0;
 
   if (Configuration::GetEventFrameworkEnabled()) {
-    issueIo2(zoneReset2);
+    issueIo2(zoneReset2, slot);
   } else {
-    issueIo(zoneReset);
+    issueIo(zoneReset, slot);
   }
 
   mUsedZones.erase(zone->GetSlba());
@@ -191,8 +193,6 @@ void Device::ResetZone(Zone* zone, void *ctx)
 void Device::FinishZone(Zone *zone, void *ctx)
 {
   RequestContext *slot = (RequestContext*)ctx;
-  slot->ioContext.ns = mNamespace;
-  slot->ioContext.qpair = mIoQueues[0];
   slot->ioContext.cb = finishComplete;
   slot->ioContext.ctx = ctx;
   slot->ioContext.offset = zone->GetSlba();
@@ -204,17 +204,15 @@ void Device::FinishZone(Zone *zone, void *ctx)
   }
 
   if (Configuration::GetEventFrameworkEnabled()) {
-    issueIo2(zoneFinish2);
+    issueIo2(zoneFinish2, slot);
   } else {
-    issueIo(zoneFinish);
+    issueIo(zoneFinish, slot);
   }
 }
 
 void Device::Write(uint64_t offset, uint32_t size, void* ctx)
 {
   RequestContext *slot = (RequestContext*)ctx;
-  slot->ioContext.ns = mNamespace;
-  slot->ioContext.qpair = mIoQueues[0];
   slot->ioContext.data = slot->data;
   slot->ioContext.metadata = slot->meta;
   slot->ioContext.offset = bytes2Block(offset);
@@ -230,17 +228,15 @@ void Device::Write(uint64_t offset, uint32_t size, void* ctx)
   }
 
   if (Configuration::GetEventFrameworkEnabled()) {
-    issueIo2(zoneWrite2);
+    issueIo2(zoneWrite2, slot);
   } else {
-    issueIo(zoneWrite);
+    issueIo(zoneWrite, slot);
   }
 }
 
 void Device::Append(uint64_t offset, uint32_t size, void* ctx)
 {
   RequestContext *slot = (RequestContext*)ctx;
-  slot->ioContext.ns = mNamespace;
-  slot->ioContext.qpair = mIoQueues[curThread];
   slot->ioContext.data = slot->data;
   slot->ioContext.metadata = slot->meta;
   slot->ioContext.offset = bytes2Block(offset);
@@ -257,17 +253,15 @@ void Device::Append(uint64_t offset, uint32_t size, void* ctx)
   }
 
   if (Configuration::GetEventFrameworkEnabled()) {
-    issueIo2(zoneAppend2);
+    issueIo2(zoneAppend2, slot);
   } else {
-    issueIo(zoneAppend);
+    issueIo(zoneAppend, slot);
   }
 }
 
 void Device::Read(uint64_t offset, uint32_t size, void* ctx)
 {
   RequestContext *slot = (RequestContext*)ctx;
-  slot->ioContext.ns = mNamespace;
-  slot->ioContext.qpair = mIoQueues[0];
   slot->ioContext.data = slot->data;
   slot->ioContext.metadata = slot->meta;
   slot->ioContext.offset = bytes2Block(offset);
@@ -283,9 +277,9 @@ void Device::Read(uint64_t offset, uint32_t size, void* ctx)
   }
 
   if (Configuration::GetEventFrameworkEnabled()) {
-    issueIo2(zoneRead2);
+    issueIo2(zoneRead2, slot);
   } else {
-    issueIo(zoneRead);
+    issueIo(zoneRead, slot);
   }
 }
 

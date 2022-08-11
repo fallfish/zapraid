@@ -2,6 +2,7 @@
 #include "segment.h"
 #include "raid_controller.h"
 #include "poller.h"
+#include <spdk/event.h>
 #include <sys/time.h>
 #include <queue>
 
@@ -214,7 +215,7 @@ ReadContextPool::ReadContextPool(uint32_t cap, RequestContextPool *rp) {
   }
 }
 
-ReadContext* ReadContext::GetContext() {
+ReadContext* ReadContextPool::GetContext() {
   while (availableContexts.empty()) {
     Recycle();
   }
@@ -226,7 +227,7 @@ ReadContext* ReadContext::GetContext() {
   return context;
 }
 
-void ReadContext::Recycle() {
+void ReadContextPool::Recycle() {
   for (auto it = inflightContexts.begin();
       it != inflightContexts.end();
       ) {
@@ -239,7 +240,7 @@ void ReadContext::Recycle() {
   }
 }
 
-bool ReadContext::checkReadAvailable(ReadContext *readContext)
+bool ReadContextPool::checkReadAvailable(ReadContext *readContext)
 {
   bool isAvailable = true;
   for (auto ctx : readContext->ioContext) {
@@ -273,7 +274,7 @@ StripeWriteContextPool::StripeWriteContextPool(uint32_t cap, struct RequestConte
   }
 }
 
-StripeWriteContext* StripeWriteContext::GetContext() {
+StripeWriteContext* StripeWriteContextPool::GetContext() {
   if (availableContexts.empty()) {
     Recycle();
     if (availableContexts.empty()) {
@@ -288,7 +289,7 @@ StripeWriteContext* StripeWriteContext::GetContext() {
   return stripe;
 }
 
-void StripeWriteContext::Recycle() {
+void StripeWriteContextPool::Recycle() {
   for (auto it = inflightContexts.begin();
       it != inflightContexts.end();
       ) {
@@ -302,11 +303,11 @@ void StripeWriteContext::Recycle() {
   }
 }
 
-bool StripeWriteContext::NoInflightStripes() {
+bool StripeWriteContextPool::NoInflightStripes() {
   return inflightContexts.empty();
 }
 
-bool StripeWriteContext::checkStripeAvailable(StripeWriteContext *stripe) {
+bool StripeWriteContextPool::checkStripeAvailable(StripeWriteContext *stripe) {
   bool isAvailable = true;
 
   for (auto slot : stripe->ioContext) {

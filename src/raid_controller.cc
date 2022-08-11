@@ -15,7 +15,6 @@
 #include <thread>
 
 #include "poller.h"
-#include "helpers.h"
 
 static void busyWait(bool *ready)
 {
@@ -115,11 +114,11 @@ void RAIDController::initIoThread()
   struct spdk_cpuset cpumask;
   for (uint32_t threadId = 0; threadId < Configuration::GetNumIoThreads(); ++threadId) {
     spdk_cpuset_zero(&cpumask);
-    spdk_cpuset_set_cpu(&cpumask, threadId + Configuration::GetIoThreadCoreId(0), true);
+    spdk_cpuset_set_cpu(&cpumask, Configuration::GetIoThreadCoreId(threadId), true);
     mIoThread[threadId].thread = spdk_thread_create("IoThread", &cpumask);
     assert(mIoThread[threadId].thread != nullptr);
     mIoThread[threadId].controller = this;
-    int rc = spdk_env_thread_launch_pinned(threadId + Configuration::GetIoThreadCoreId(0), ioWorker, &mIoThread[threadId]);
+    int rc = spdk_env_thread_launch_pinned(Configuration::GetIoThreadCoreId(threadId), ioWorker, &mIoThread[threadId]);
     printf("ZNS_RAID io thread %s %lu\n", spdk_thread_get_name(mIoThread[threadId].thread), spdk_thread_get_id(mIoThread[threadId].thread));
     if (rc < 0) {
       printf("Failed to launch IO thread error: %s %s\n", strerror(rc), spdk_strerror(rc));
@@ -212,7 +211,7 @@ void RAIDController::Init(bool need_env)
     for (uint32_t threadId = 0;
          threadId < Configuration::GetNumIoThreads(); 
          ++threadId) {
-      event_call(Configuration::GetCompletionThreadCoreId(threadId),
+      event_call(Configuration::GetIoThreadCoreId(threadId),
                  registerIoCompletionRoutine, &mIoThread[threadId], nullptr);
     }
   } else {

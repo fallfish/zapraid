@@ -7,7 +7,9 @@
 #include <vector>
 #include <map>
 #include <list>
-#include "spdk/nvme.h"
+#include <spdk/nvme.h>
+#include <spdk/thread.h>
+#include <spdk/event.h>
 #include "configuration.h"
 
 class Segment;
@@ -223,7 +225,6 @@ struct RequestContextPool {
   RequestContext *getRequestContext(bool force);
   void returnRequestContext(RequestContext *slot);
 };
-
 
 struct ReadContextPool {
   ReadContext *contexts;

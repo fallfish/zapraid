@@ -40,6 +40,8 @@ public:
   std::map<uint64_t, std::pair<uint32_t, uint8_t*>> ReadZoneHeaders();
 
 private:
+  void issueIo2(spdk_event_fn event_fn, RequestContext *slot);
+  void issueIo(spdk_msg_fn msg_fn, RequestContext *slot);
   uint64_t bytes2Block(uint64_t bytes);
   uint64_t bytes2ZoneNum(uint64_t bytes);
 

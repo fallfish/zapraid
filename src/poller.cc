@@ -24,7 +24,7 @@ void updatePba2(void *arg1, void *arg2)
 }
 
 void updatePba(void *args) {
-  UpdatePbaArgs *qArgs = reinterpret_cast<UpdatePbaArgs*>args;
+  UpdatePbaArgs *qArgs = reinterpret_cast<UpdatePbaArgs*>(args);
   RAIDController *ctrl = qArgs->ctrl;
   RequestContext *ctx = qArgs->ctx;
   free(qArgs);
