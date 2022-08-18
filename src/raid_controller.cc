@@ -167,7 +167,7 @@ void RAIDController::Init(bool need_env)
   mReadContextPool = new ReadContextPool(128, mRequestContextPoolForSegments);
 
   // Initialize address map
-  mAddressMap = new std::unordered_map<LogicalAddr, PhysicalAddr>();
+  mAddressMap = new std::unordered_map<uint64_t, PhysicalAddr>();
 
   // Create poll groups for the io threads and perform initialization
   for (uint32_t threadId = 0; threadId < Configuration::GetNumIoThreads(); ++threadId) {
@@ -309,6 +309,7 @@ void RAIDController::UpdateIndex(uint64_t lba, PhysicalAddr pba)
   }
   assert(pba.segment != nullptr);
   (*mAddressMap)[lba] = pba;  
+//  printf("Update lba %lu with pba %u %u %u\n", lba, pba.segment, pba.zoneId, pba.offset);
   pba.segment->FinishBlock(pba.zoneId, pba.offset, lba);
   mNumBlocks += 1;
 }
@@ -342,6 +343,27 @@ void RAIDController::ReclaimContexts()
   }
 }
 
+void RAIDController::Flush()
+{
+  bool remainWrites;
+  do {
+    remainWrites = false;
+    for (auto it = mInflightRequestContext.begin();
+              it != mInflightRequestContext.end(); ) {
+      if ((*it)->available) {
+        (*it)->Clear();
+        mRequestContextPoolForUserRequests->returnRequestContext(*it);
+        it = mInflightRequestContext.erase(it);
+      } else {
+        if ((*it)->req_type == 'W') {
+          remainWrites = true;
+        }
+        ++it;
+      }
+    }
+  } while (remainWrites);
+}
+
 RequestContext* RAIDController::getContextForUserRequest()
 {
   RequestContext *ctx = mRequestContextPoolForUserRequests->getRequestContext(false);
@@ -362,7 +384,6 @@ void RAIDController::doExecute(
     uint64_t offset, uint32_t size, void *data, bool is_write,
     zns_raid_request_complete cb_fn, void *cb_args)
 {
-
   RequestContext *ctx = getContextForUserRequest();
   ctx->type = USER;
   ctx->data = (uint8_t*)data;
@@ -393,11 +414,6 @@ void RAIDController::doExecute(
 
 void RAIDController::WriteInDispatchThread(RequestContext *ctx)
 {
-//  static double part1 = 0, part2 = 0, part3 = 0;
-//  static int count1 = 0, count2 = 0;
-  struct timeval s, e;
-  double elapsed1, elapsed2;
-
   uint32_t blockSize = Configuration::GetBlockSize();
   uint32_t curOffset = ctx->curOffset;
   uint32_t size = ctx->size;
@@ -450,13 +466,14 @@ void RAIDController::WriteInDispatchThread(RequestContext *ctx)
 
 bool RAIDController::LookupIndex(uint64_t lba, PhysicalAddr *pba)
 {
-//  std::lock_guard<std::mutex> l(mIndexLock);
   auto it = mAddressMap->find(lba);
   if (it != mAddressMap->end()) {
     *pba = it->second;
+//    printf("Lookup lba %lu with (*pba) %p %u %u\n", lba, (*pba).segment, (*pba).zoneId, (*pba).offset);
     return true;
   } else {
     pba->segment = nullptr;
+//    printf("Lookup lba %lu with pba not found\n", lba);
     return false;
   }
 }
@@ -492,8 +509,7 @@ void RAIDController::ReadInDispatchThread(RequestContext *ctx)
           ctx->Queue();
         }
       } else {
-        segment->Read(ctx, i * Configuration::GetBlockSize(),
-                      ctx->pbaArray[i]);
+        segment->Read(ctx, i * Configuration::GetBlockSize(), ctx->pbaArray[i]);
       }
     }
   }
@@ -553,33 +569,30 @@ bool RAIDController::ProceedGc()
     initializeGcTask();
   }
 
-  if (mGcTask.stage == GC_RUNNING) {
+  if (mGcTask.stage == REWRITING) {
     hasProgress |= progressGcWriter();
     hasProgress |= progressGcReader();
 
     if (mGcTask.curZoneId == mGcTask.maxZoneId) {
       if (mGcTask.numWriteFinish == mGcTask.numWriteSubmitted) {
-        printf("Number of valid rewritten blocks: %lu, num blocks in zone group: %lu\n", mGcTask.mappings.size(), mGcTask.inputSegment->GetNumBlocks());
-        mGcTask.stage = COMPLETE;
-      } else {
-        if (mGcTask.outputSegment != nullptr) {
-          mGcTask.outputSegment->FlushStripe();
-        }
+//        printf("Number of valid rewritten blocks: %lu, num blocks in zone group: %lu\n", mGcTask.mappings.size(), mGcTask.inputSegment->GetNumBlocks());
+        mGcTask.stage = REWRITE_COMPLETE;
       }
     }
   } 
   
-  if (mGcTask.stage == COMPLETE) {
+  if (mGcTask.stage == REWRITE_COMPLETE) {
     hasProgress = true;
-    progressGcIndexUpdate();
-    if (mGcTask.mappings.size() == 0) {
-      mNumInvalidBlocks -= mGcTask.inputSegment->GetNumBlocks();
-      mNumBlocks -= mGcTask.inputSegment->GetNumBlocks();
-      assert(mNumInvalidBlocks > 0);
-      printf("Complete finishing\n");
-      mGcTask.inputSegment->Reset(nullptr);
-      mGcTask.stage = IDLE;
-    }
+    mGcTask.stage = INDEX_UPDATING;
+  }
+
+  if (mGcTask.stage == INDEX_UPDATE_COMPLETE) {
+    mNumInvalidBlocks -= mGcTask.inputSegment->GetNumBlocks();
+    mNumBlocks -= mGcTask.inputSegment->GetNumBlocks();
+    assert(mNumInvalidBlocks > 0);
+    printf("Complete finishing\n");
+    mGcTask.inputSegment->Reset(nullptr);
+    mGcTask.stage = IDLE;
   }
 
   return hasProgress;
@@ -686,7 +699,7 @@ void RAIDController::initializeGcTask()
 {
   mGcTask.curZoneId = 0;
   mGcTask.nextOffset = 0;
-  mGcTask.stage = GC_RUNNING;
+  mGcTask.stage = REWRITING;
 
   mGcTask.writerPos = 0;
   mGcTask.readerPos = 0;
@@ -797,24 +810,6 @@ bool RAIDController::progressGcWriter()
   return hasProgress;
 }
 
-void RAIDController::progressGcIndexUpdate()
-{
-  std::vector<uint64_t> lbas;
-  std::vector<std::pair<PhysicalAddr, PhysicalAddr>> pbas;
-
-  for (uint16_t i = 0; i < 16; ++i) {
-    if (mGcTask.mappings.size() == 0) {
-      break;
-    }
-    auto it = mGcTask.mappings.begin();
-    lbas.emplace_back(it->first);
-    pbas.emplace_back(it->second);
-    mGcTask.mappings.erase(it);
-  }
-
-  GcBatchUpdateIndex(lbas, pbas);
-}
-
 bool RAIDController::CheckSegments()
 {
   bool stateChanged = false;
@@ -843,4 +838,9 @@ bool RAIDController::CheckSegments()
   }
 
   return stateChanged;
+}
+
+GcTask* RAIDController::GetGcTask()
+{
+  return &mGcTask;
 }

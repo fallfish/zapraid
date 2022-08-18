@@ -30,10 +30,6 @@ Segment::Segment(RAIDController *raidController,
   int n = Configuration::GetStripeSize() / Configuration::GetStripeUnitSize();
   int k = Configuration::GetStripeDataSize() / Configuration::GetStripeUnitSize();
 
-  mRaidController = raidController;
-  mZonePos = 0;
-  mStripePos = 0;
-
   if (gEncodeMatrix == nullptr) {
     gEncodeMatrix = new uint8_t[n * k];
     gGfTables = new uint8_t[32 * n * (n - k)];
@@ -41,6 +37,10 @@ Segment::Segment(RAIDController *raidController,
     ec_init_tables(k, n - k, &gEncodeMatrix[k * k], gGfTables);
     printf("gGfTables: %p\n", gGfTables);
   }
+
+  mRaidController = raidController;
+  mZonePos = 0;
+  mStripePos = 0;
 
   mRequestContextPool = ctxPool;
   mReadContextPool = rctxPool;
@@ -75,12 +75,12 @@ Segment::Segment(RAIDController *raidController,
   mNumInvalidBlocks = 0;
   mCapacity = Configuration::GetZoneCapacity();
 
-//  mValidBits.resize(mSegmentMeta.n * mCapacity);
-//  mBlockMetadata.resize(mSegmentMeta.n * mCapacity);
   mValidBits = new bool[mSegmentMeta.n * mCapacity];
   memset(mValidBits, 0, mSegmentMeta.n * mCapacity);
-  mBlockMetadata = new BlockMetadata[mSegmentMeta.n * mCapacity];
-  memset(mBlockMetadata, 0, mSegmentMeta.n * mCapacity);
+  mCompactStripeTable = new uint8_t[mSegmentMeta.n * mCapacity];
+  memset(mCompactStripeTable, 0, mSegmentMeta.n * mCapacity);
+  mProtectedBlockMetadata = new ProtectedBlockMetadata[mSegmentMeta.n * mCapacity];
+  memset(mProtectedBlockMetadata, 0, mSegmentMeta.n * mCapacity);
 
   if (Configuration::GetEnableHeaderFooter()) {
     // Adjust the capacity for user data = total capacity - footer size
@@ -100,7 +100,8 @@ Segment::~Segment()
 {
   // TODO: reclaim zones to devices
   delete mValidBits;
-  delete mBlockMetadata;
+  delete mCompactStripeTable;
+  delete mProtectedBlockMetadata;
   spdk_free(mCurrentNamedGroupMetadata.data);
   spdk_free(mCurrentNamedGroupMetadata.metadata);
   // delete mValidBits;
@@ -292,6 +293,7 @@ bool Segment::StateTransition()
           thread_send_msg(mRaidController->GetEcThread(), progressFooterWriter, this);
         } else {
           event_call(Configuration::GetEcThreadCoreId(), progressFooterWriter2, this, nullptr);
+//          event_call(Configuration::GetEcThreadCoreId(), progressFooterWriter2, this, nullptr);
         }
       }
     }
@@ -384,8 +386,8 @@ void Segment::ProgressFooterWriter()
     uint64_t *footerBlock = reinterpret_cast<uint64_t*>(mCurStripe->data[zid]);
     uint32_t pos = 0;
     for (uint32_t offset = begin; offset < end; ++offset) {
-      footerBlock[pos++] = mBlockMetadata[base + offset].fields.protectedField.lba;
-      footerBlock[pos++] = mBlockMetadata[base + offset].fields.protectedField.timestamp;
+      footerBlock[pos++] = mProtectedBlockMetadata[base + offset].lba;
+      footerBlock[pos++] = mProtectedBlockMetadata[base + offset].timestamp;
     }
   }
   encodeStripe(mCurStripe->data, mSegmentMeta.n, mSegmentMeta.k, Configuration::GetBlockSize());
@@ -444,8 +446,11 @@ struct GenerateParityBlockArgs {
 void generateParityBlock2(void *arg1, void *arg2)
 {
   struct GenerateParityBlockArgs *gen_args = reinterpret_cast<struct GenerateParityBlockArgs*>(arg1);
-  gen_args->segment->GenerateParityBlock(gen_args->stripe, gen_args->zonePos);
+  Segment *segment = reinterpret_cast<Segment*>(gen_args->segment);
+  StripeWriteContext *stripe = reinterpret_cast<StripeWriteContext*>(gen_args->stripe);
+  uint32_t zonePos = gen_args->zonePos;
   free(gen_args);
+  segment->GenerateParityBlock(stripe, zonePos);
 }
 
 void generateParityBlock(void *args)
@@ -480,7 +485,8 @@ bool Segment::Append(RequestContext *ctx, uint32_t offset)
   {
     RequestContext *slot = mRequestContextPool->getRequestContext(true);
     mCurStripe->ioContext[whichBlock] = slot;
-    slot->data = blkdata;
+    slot->data = slot->dataBuffer;
+    memcpy(slot->data, blkdata, Configuration::GetBlockSize());
     slot->meta = slot->metadataBuffer;
 
     slot->associatedStripe = mCurStripe;
@@ -524,6 +530,7 @@ bool Segment::Append(RequestContext *ctx, uint32_t offset)
     } else {
       event_call(Configuration::GetEcThreadCoreId(), generateParityBlock2, args, nullptr);
     }
+
 
     mStripePos = 0;
     mZonePos += 1;
@@ -917,6 +924,69 @@ void Segment::ReadStripeMeta(RequestContext *ctx)
   }
 }
 
+void Segment::ReadStripeMemorySufficient(RequestContext *ctx)
+{
+  SystemMode mode = Configuration::GetSystemMode();
+
+  uint32_t zoneId = ctx->zoneId;
+  uint32_t offset = ctx->offset;
+  uint32_t n = Configuration::GetStripeSize() / Configuration::GetStripeUnitSize();
+  uint32_t k = Configuration::GetStripeDataSize() / Configuration::GetStripeUnitSize();
+  ReadContext *readContext = ctx->associatedRead;
+
+  uint32_t groupId = offset / Configuration::GetSyncGroupSize();
+  uint32_t searchBegin = groupId * Configuration::GetSyncGroupSize();
+  uint32_t searchEnd = groupId * Configuration::GetSyncGroupSize();
+
+  // Find out the stripeId of the requested block
+  uint32_t index = zoneId * mCapacity + offset;
+  uint8_t  stripeId = mCompactStripeTable[index];
+
+  uint32_t realOffsets[n];
+  // Search the stripe Id table
+  for (uint32_t i = 0; i < n; ++i) {
+    realOffsets[i] = ~0u;
+    if (i == zoneId) {
+      realOffsets[i] = offset;
+      continue;
+    }
+    for (uint32_t j = searchBegin; j < searchEnd; ++j) {
+      uint32_t index = i * mCapacity + j;
+      if (mCompactStripeTable[index] == stripeId) {
+        if (realOffsets[i] != ~0u) printf("Duplicate stripe ID!\n");
+        realOffsets[i] = mCompactStripeTable[index];
+      }
+    }
+    if (realOffsets[i] == ~0u) printf("Not find the stripe ID!\n");
+  }
+
+  uint32_t cnt = 0;
+  for (uint32_t i = 0; i < n && cnt < k; ++i) {
+    if (i == zoneId) continue;
+    RequestContext *reqCtx = nullptr;
+    reqCtx = mRequestContextPool->getRequestContext(true);
+    readContext->ioContext.emplace_back(reqCtx);
+
+    reqCtx->Clear();
+    reqCtx->associatedRequest = ctx;
+    reqCtx->status = DEGRADED_READ_SUB;
+    reqCtx->type = STRIPE_UNIT;
+    reqCtx->targetBytes = Configuration::GetStripeUnitSize();
+    reqCtx->ctrl = mRaidController;
+    reqCtx->segment = this;
+    reqCtx->zoneId = i;
+    reqCtx->offset = realOffsets[i];
+    reqCtx->data = reqCtx->dataBuffer;
+    reqCtx->meta = reqCtx->metadataBuffer;
+
+    readContext->data[i] = reqCtx->data;
+
+    mZones[i]->Read(realOffsets[i], Configuration::GetStripeUnitSize(), reqCtx);
+
+    ++cnt;
+  }
+}
+
 void Segment::ReadStripe(RequestContext *ctx)
 {
   SystemMode mode = Configuration::GetSystemMode();
@@ -1052,12 +1122,15 @@ void Segment::ReadStripe(RequestContext *ctx)
 
 void Segment::WriteComplete(RequestContext *ctx)
 {
-  BlockMetadata &meta = mBlockMetadata[ctx->zoneId * mCapacity + ctx->offset];
-  // Note that here the (lba, timestamp, stripeId) is not the one written to flash page
-  // Thus the lba and timestamp is "INVALID" for parity block, and the footer is valid
-  meta.fields.protectedField.lba = ctx->lba;
-  meta.fields.protectedField.timestamp = ctx->timestamp;
-  meta.fields.nonProtectedField.stripeId = ctx->stripeId;
+  uint32_t index = ctx->zoneId * mCapacity + ctx->offset;
+  if (Configuration::GetDeviceSupportMetadata()) {
+    // Note that here the (lba, timestamp, stripeId) is not the one written to flash page
+    // Thus the lba and timestamp is "INVALID" for parity block, and the footer is valid
+    ProtectedBlockMetadata &pbm = mProtectedBlockMetadata[index];
+    pbm.lba = ctx->lba;
+    pbm.timestamp = ctx->timestamp;
+  }
+  mCompactStripeTable[index] = ctx->stripeId;
 }
 
 void Segment::ReadComplete(RequestContext *ctx)
@@ -1101,10 +1174,12 @@ void Segment::ReadComplete(RequestContext *ctx)
 
   if (!Configuration::GetDeviceSupportMetadata()) {
     BlockMetadata *meta = (BlockMetadata*)ctx->meta;
-    meta->fields.protectedField.lba = mBlockMetadata[zoneId * mCapacity + offset].fields.protectedField.lba;
-    meta->fields.protectedField.timestamp = mBlockMetadata[zoneId * mCapacity + offset].fields.protectedField.timestamp;
-    meta->fields.nonProtectedField.stripeId = mBlockMetadata[zoneId * mCapacity + offset].fields.nonProtectedField.stripeId;
+    uint32_t index = zoneId * mCapacity + offset;
+    meta->fields.protectedField.lba = mProtectedBlockMetadata[index].lba;
+    meta->fields.protectedField.timestamp = mProtectedBlockMetadata[index].timestamp;
+    meta->fields.nonProtectedField.stripeId = mCompactStripeTable[index];
   }
+
   if (parent->type == GC && parent->meta) {
     uint32_t offsetInBlks = (ctx->lba - parent->lba) / Configuration::GetBlockSize();
     BlockMetadata *result = (BlockMetadata*)(ctx->meta);

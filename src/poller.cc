@@ -288,7 +288,6 @@ int ecWorker(void *args)
 {
   RAIDController *raidController = (RAIDController*)args;
   struct spdk_thread *thread = raidController->GetEcThread();
-  printf("Ec: %p\n", thread);
   spdk_set_thread(thread);
   while (true) {
     spdk_thread_poll(thread, 0, 0);
@@ -509,3 +508,20 @@ void tryDrainController(void *args)
 
   drainArgs->ready = true;
 }
+
+void progressGcIndexUpdate(void *args)
+{
+  RAIDController *ctrl = reinterpret_cast<RAIDController*>(args);
+  GcTask *task = ctrl->GetGcTask();
+  std::vector<uint64_t> lbas; //= new std::vector<uint64_t>();
+  std::vector<std::pair<PhysicalAddr, PhysicalAddr>> pbas;
+//    = new std::vector<std::pair<PhysicalAddr, PhysicalAddr>>();
+
+  for (auto it = task->mappings.begin(); it != task->mappings.end(); ++it) {
+    lbas.emplace_back(it->first);
+    pbas.emplace_back(it->second);
+  }
+
+  ctrl->GcBatchUpdateIndex(lbas, pbas);
+}
+

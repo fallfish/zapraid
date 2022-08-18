@@ -128,6 +128,7 @@ public:
 
   void ReadStripeMeta(RequestContext *ctx);
   void ReadStripe(RequestContext *ctx);
+  void ReadStripeMemorySufficient(RequestContext *ctx);
 
   void WriteComplete(RequestContext *ctx);
   void ReadComplete(RequestContext *ctx);
@@ -173,8 +174,11 @@ private:
   
 //   std::vector<bool> mValidBits;
 //   std::vector<BlockMetadata> mBlockMetadata;
-   bool* mValidBits;
-   BlockMetadata* mBlockMetadata; // if the backend support _with_md commands, then this is not used.
+  bool* mValidBits;
+  uint8_t* mCompactStripeTable;
+  // if the backend support _with_md commands, then this is not used.
+  ProtectedBlockMetadata *mProtectedBlockMetadata;
+
   std::vector<Zone*> mZones;
   std::vector<RequestContext> mResetContext;
   uint32_t mZonePos;

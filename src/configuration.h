@@ -167,30 +167,30 @@ public:
   }
 
   static bool GetEventFrameworkEnabled() {
-    return false;
+    return true;
   }
 
   static bool GetIsBrandNew() {
     return GetInstance().gIsBrandNew;
   }
 
-  static bool GetEcThreadCoreId() {
+  static uint32_t GetEcThreadCoreId() {
     return GetInstance().gEcThreadCoreId;
   }
 
-  static bool GetIndexThreadCoreId() {
+  static uint32_t GetIndexThreadCoreId() {
     return GetInstance().gIndexThreadCoreId;
   }
 
-  static bool GetDispatchThreadCoreId() {
+  static uint32_t GetDispatchThreadCoreId() {
     return GetInstance().gDispatchThreadCoreId;
   }
 
-  static bool GetCompletionThreadCoreId() {
+  static uint32_t GetCompletionThreadCoreId() {
     return GetInstance().gCompletionThreadCoreId;
   }
 
-  static bool GetIoThreadCoreId(uint32_t thread_id) {
+  static uint32_t GetIoThreadCoreId(uint32_t thread_id) {
     return GetInstance().gIoThreadCoreIdBase + thread_id;
   }
 
@@ -259,10 +259,10 @@ private:
   SystemMode gSystemMode = NAMED_WRITE;
   // 0: Pure write; 1: Pure zone append; 2: Zone append without metadata; 3: Zone append with metadata; 4: Zone append with redirection
 
-  uint32_t gEcThreadCoreId = 1;
-  uint32_t gIndexThreadCoreId = 2;
-  uint32_t gDispatchThreadCoreId = 3;
-  uint32_t gCompletionThreadCoreId = 4;
-  uint32_t gIoThreadCoreIdBase = 5;
+  uint32_t gIndexThreadCoreId = 4;
+  uint32_t gDispatchThreadCoreId = 5;
+  uint32_t gCompletionThreadCoreId = 6;
+  uint32_t gIoThreadCoreIdBase = 7;
+  uint32_t gEcThreadCoreId = 8;
 };
 

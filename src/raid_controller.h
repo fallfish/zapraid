@@ -122,6 +122,8 @@ public:
    */
   bool LookupIndex(uint64_t lba, PhysicalAddr *phyAddr);
   void ReclaimContexts();
+  void Flush();
+  GcTask* GetGcTask();
 
 private:
   RequestContext* getContextForUserRequest();
@@ -143,10 +145,9 @@ private:
   void initializeGcTask();
   bool progressGcWriter();
   bool progressGcReader();
-  void progressGcIndexUpdate();
 
   std::vector<Device*> mDevices;
-  std::unordered_map<LogicalAddr, PhysicalAddr> *mAddressMap;
+  std::unordered_map<uint64_t, PhysicalAddr> *mAddressMap;
   std::vector<Segment*> mSealedSegments;
   std::vector<Segment*> mSegmentsToSeal;
   std::vector<Segment*> mOpenSegments;

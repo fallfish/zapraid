@@ -26,6 +26,12 @@ extern "C" void zns_raid_read(void *ctrl, uint64_t offset, uint32_t size, void *
   ctrl1->Read(offset, size, data, cb_fn, args);
 }
 
+extern "C" void zns_raid_flush(void *ctrl)
+{
+  RAIDController *ctrl1 = (RAIDController*)ctrl;
+  ctrl1->Flush();
+}
+
 extern "C" void zns_raid_set_system_mode(int mode)
 {
   Configuration::SetSystemMode(SystemMode(mode));

@@ -22,7 +22,6 @@ typedef void (*zns_raid_request_complete)(void *cb_arg);
 void thread_send_msg(spdk_thread *thread, spdk_msg_fn fn, void *args);
 void event_call(uint32_t core_id, spdk_event_fn fn, void *arg1, void *arg2);
 
-typedef uint64_t LogicalAddr;
 struct PhysicalAddr {
   Segment* segment;
   uint32_t zoneId;
@@ -87,17 +86,19 @@ struct ReadContext {
   std::vector<RequestContext*> ioContext;
 };
 
+struct ProtectedBlockMetadata {
+  uint64_t lba;
+  uint64_t timestamp;
+};
+
+struct NonProtectedBlockMetadata {
+  uint8_t stripeId;
+};
+
 union BlockMetadata {
   struct {
-    struct
-    {
-      uint64_t lba;
-      uint64_t timestamp;
-    } protectedField;
-    struct
-    {
-      uint32_t stripeId;
-    } nonProtectedField;
+    struct ProtectedBlockMetadata protectedField;
+    struct NonProtectedBlockMetadata nonProtectedField;
   } fields;
   uint8_t reserved[64];
 };
@@ -181,7 +182,10 @@ struct NamedMetadata {
 enum GcTaskStage {
   IDLE,
   INIT,
-  GC_RUNNING,
+  REWRITING,
+  REWRITE_COMPLETE,
+  INDEX_UPDATING,
+  INDEX_UPDATE_COMPLETE,
   COMPLETE
 };
 

@@ -6,8 +6,8 @@
 
 #include <rte_errno.h>
 
- uint32_t gSize = 128 * 1024 * 1024ull / Configuration::GetBlockSize();
-// uint32_t gSize = 8 * 1024 * 1024 * 1024ull / Configuration::GetBlockSize();
+//  uint32_t gSize = 128 * 1024 * 1024ull / Configuration::GetBlockSize();
+uint32_t gSize = 64 * 1024 * 1024 * 1024ull / Configuration::GetBlockSize();
 
 RAIDController *gRaidController;
 uint8_t *buffer_pool;
@@ -42,7 +42,7 @@ void validate()
   printf("Validating...\n");
   struct timeval s, e;
   gettimeofday(&s, NULL);
- Configuration::SetEnableDegradedRead(true);
+  Configuration::SetEnableDegradedRead(true);
   for (uint64_t i = 0; i < gSize; ++i) {
     LatencyBucket b;
     gettimeofday(&b.s, NULL);
