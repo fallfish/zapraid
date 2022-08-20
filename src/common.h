@@ -17,10 +17,31 @@ class RAIDController;
 struct RequestContext;
 struct GcTask;
 
+inline uint64_t round_up(uint64_t value, uint64_t align)
+{
+  return (value + align - 1) / align * align;
+}
+
+inline uint64_t round_down(uint64_t value, uint64_t align)
+{
+  return value / align * align;
+}
+
+
 typedef void (*zns_raid_request_complete)(void *cb_arg);
 
 void thread_send_msg(spdk_thread *thread, spdk_msg_fn fn, void *args);
 void event_call(uint32_t core_id, spdk_event_fn fn, void *arg1, void *arg2);
+
+struct Request {
+  RAIDController *controller;
+  uint64_t offset;
+  uint32_t size;
+  void *data;
+  char type;
+  zns_raid_request_complete cb_fn;
+  void *cb_args;
+};
 
 struct PhysicalAddr {
   Segment* segment;
@@ -186,6 +207,7 @@ enum GcTaskStage {
   REWRITE_COMPLETE,
   INDEX_UPDATING,
   INDEX_UPDATE_COMPLETE,
+  RESETTING_INPUT_SEGMENT,
   COMPLETE
 };
 

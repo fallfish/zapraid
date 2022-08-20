@@ -23,8 +23,8 @@ struct SegmentMetadata {
 
 enum SegmentStatus {
   SEGMENT_NORMAL,
-  SEGMENT_PREPARE_NAMED_META,
-  SEGMENT_WRITING_NAMED_META,
+  SEGMENT_PREPARE_ZAPRAID,
+  SEGMENT_WRITING_ZAPRAID,
   SEGMENT_WRITING_HEADER,
   SEGMENT_PREPARE_FOOTER,
   SEGMENT_WRITING_FOOTER,
@@ -101,6 +101,7 @@ public:
    * @param ctx the controller maintained context, tracking the reset progress
    */
   void Reset(RequestContext *ctx);
+  bool IsResetDone();
 
   /**
    * @brief Seal the segment by finishing all the zones
@@ -181,13 +182,17 @@ private:
 
   std::vector<Zone*> mZones;
   std::vector<RequestContext> mResetContext;
-  uint32_t mZonePos;
-  uint32_t mCapacity; //  = 1024 * 1024 * 1024ull / gBlockSize;
-  uint32_t mInternalCapacity;
+
+  uint32_t mPos;
+
+  uint32_t mHeaderRegionSize;
+  uint32_t mDataRegionSize;
+  uint32_t mFooterRegionSize;
+
   uint32_t mNumInvalidBlocks;
   uint32_t mNumBlocks;
 
-  uint32_t mStripePos;
+  uint32_t mPosInStripe;
   uint32_t mCurStripeId;
 
   static uint8_t *gEncodeMatrix;

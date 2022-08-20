@@ -34,6 +34,8 @@ void queryPba(void *args);
 void updatePba(void *args);
 
 // Used under spdk event library
+void executeRequest(void *arg1, void *arg2);
+
 void registerIoCompletionRoutine(void *arg1, void *arg2);
 void registerDispatchRoutine(void *arg1, void *arg2);
 void handleEventCompletion2(void *arg1, void *arg2);
@@ -55,5 +57,8 @@ void zoneAppend(void *args);
 void zoneReset(void *args);
 void zoneFinish(void *args);
 
+// GC
+void progressGcIndexUpdate2(void *arg1, void *arg2);
+void progressGcIndexUpdate(void *args);
 
 #endif

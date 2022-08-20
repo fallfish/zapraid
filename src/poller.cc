@@ -40,7 +40,8 @@ static void dummy_disconnect_handler(struct spdk_nvme_qpair *qpair, void *poll_g
 int handleIoCompletions(void *args)
 {
   struct spdk_nvme_poll_group* pollGroup = (struct spdk_nvme_poll_group*)args;
-  int r = spdk_nvme_poll_group_process_completions(pollGroup, 0, dummy_disconnect_handler);
+  int r = 0;
+  r = spdk_nvme_poll_group_process_completions(pollGroup, 0, dummy_disconnect_handler);
   return r > 0 ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
 }
 
@@ -63,19 +64,21 @@ static bool contextReady(RequestContext *ctx)
 static void handleUserContext(RequestContext *context)
 {
   ContextStatus &status = context->status;
+  RAIDController *ctrl = context->ctrl;
   assert(contextReady(context));
   if (status == WRITE_REAPING) {
     status = WRITE_INDEX_UPDATING;
     if (!Configuration::GetEventFrameworkEnabled()) {
       UpdatePbaArgs *args = (UpdatePbaArgs*)calloc(1, sizeof(UpdatePbaArgs));
-      args->ctrl = context->ctrl;
+      args->ctrl = ctrl;
       args->ctx = context;
-      thread_send_msg(args->ctrl->GetIndexThread(), updatePba, args);
+      thread_send_msg(ctrl->GetIndexThread(), updatePba, args);
     } else {
       event_call(Configuration::GetIndexThreadCoreId(),
-                 updatePba2, context->ctrl, context);
+                 updatePba2, ctrl, context);
     }
   } else if (status == READ_REAPING) {
+    ctrl->RemoveRequestFromGcEpochIfNecessary(context);
     status = READ_COMPLETE;
     if (context->cb_fn != nullptr) {
       context->cb_fn(context->cb_args);
@@ -145,7 +148,7 @@ static void handleStripeUnitContext(RequestContext *context)
       if (context->needDegradedRead) {
         context->needDegradedRead = false;
         SystemMode mode = Configuration::GetSystemMode();
-        if (mode == NAMED_META || mode == REDIRECTION) {
+        if (mode == ZAPRAID) {
           status = DEGRADED_READ_META;
           context->segment->ReadStripeMeta(context);
         } else {
@@ -180,11 +183,7 @@ static void handleStripeUnitContext(RequestContext *context)
       }
       break;
     case RESET_REAPING:
-      context->associatedRequest->targetBytes += 1;
       status = RESET_COMPLETE;
-      if (contextReady(context->associatedRequest)) {
-        handleUserContext(context->associatedRequest);
-      }
       context->available = true;
       break;
     case FINISH_REAPING:
@@ -266,7 +265,7 @@ int handleEventsDispatch(void *args)
 int handleBackgroundTasks(void *args) {
   RAIDController *raidController = (RAIDController*)args;
   bool hasProgress = false;
-//  bool hasProgress = raidController->ProceedGc();
+  hasProgress |= raidController->ProceedGc();
   hasProgress |= raidController->CheckSegments();
 
   return hasProgress ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
@@ -311,6 +310,15 @@ int completionWorker(void *args) {
   while (true) {
     spdk_thread_poll(thread, 0, 0);
   }
+}
+
+void executeRequest(void *arg1, void *arg2)
+{
+  Request *req = reinterpret_cast<Request*>(arg1);
+  req->controller->Execute(
+    req->offset, req->size, req->data,
+    req->type == 'W', req->cb_fn, req->cb_args);
+  free(req);
 }
 
 void registerIoCompletionRoutine(void *arg1, void *arg2)
@@ -509,9 +517,9 @@ void tryDrainController(void *args)
   drainArgs->ready = true;
 }
 
-void progressGcIndexUpdate(void *args)
+void progressGcIndexUpdate2(void *arg1, void *arg2)
 {
-  RAIDController *ctrl = reinterpret_cast<RAIDController*>(args);
+  RAIDController *ctrl = reinterpret_cast<RAIDController*>(arg1);
   GcTask *task = ctrl->GetGcTask();
   std::vector<uint64_t> lbas; //= new std::vector<uint64_t>();
   std::vector<std::pair<PhysicalAddr, PhysicalAddr>> pbas;
@@ -523,5 +531,11 @@ void progressGcIndexUpdate(void *args)
   }
 
   ctrl->GcBatchUpdateIndex(lbas, pbas);
+  task->stage = INDEX_UPDATE_COMPLETE;
+}
+
+void progressGcIndexUpdate(void *args)
+{
+  progressGcIndexUpdate2(args, nullptr);
 }
 

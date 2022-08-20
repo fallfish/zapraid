@@ -12,7 +12,7 @@ class Zone;
 class Device {
 public:
   void Init(struct spdk_nvme_ctrlr *ctrlr, int nsid);
-  void InitZones();
+  void InitZones(uint32_t numNeededZones, uint32_t numReservedZones);
   void EraseWholeDevice();
   void ConnectIoPairs();
 
@@ -24,7 +24,9 @@ public:
   // admin commands
   void ResetZone(Zone *zone, void *ctx);
   void FinishZone(Zone *zone, void *ctx); // seal
+  bool HasAvailableZone();
   Zone* OpenZone();
+  void  ReturnZone(Zone*);
 
   void AddAvailableZone(Zone *zone);
 
@@ -35,6 +37,7 @@ public:
   struct spdk_nvme_ns* GetNamespace() { return mNamespace; }
   struct spdk_nvme_qpair** GetIoQueues() { return mIoQueues; }
 
+  uint64_t GetZoneCapacity();
   uint32_t GetNumZones();
 
   std::map<uint64_t, std::pair<uint32_t, uint8_t*>> ReadZoneHeaders();

@@ -7,7 +7,7 @@
 #include <rte_errno.h>
 
 //  uint32_t gSize = 128 * 1024 * 1024ull / Configuration::GetBlockSize();
-uint32_t gSize = 64 * 1024 * 1024 * 1024ull / Configuration::GetBlockSize();
+uint32_t gSize = 4 * 1024 * 1024 * 1024ull / Configuration::GetBlockSize();
 
 RAIDController *gRaidController;
 uint8_t *buffer_pool;
@@ -42,7 +42,7 @@ void validate()
   printf("Validating...\n");
   struct timeval s, e;
   gettimeofday(&s, NULL);
-  Configuration::SetEnableDegradedRead(true);
+//  Configuration::SetEnableDegradedRead(true);
   for (uint64_t i = 0; i < gSize; ++i) {
     LatencyBucket b;
     gettimeofday(&b.s, NULL);
@@ -108,7 +108,16 @@ int main(int argc, char *argv[])
     gettimeofday(&buckets[i].s, NULL);
 //    gRaidController->Write(i * Configuration::GetBlockSize(), Configuration::GetBlockSize(), buckets[i].buffer, latency_puncher, &buckets[i]);
     gRaidController->Write(i * Configuration::GetBlockSize(),
-                           Configuration::GetBlockSize(),
+                           1 * Configuration::GetBlockSize(),
+                           buckets[i].buffer,
+                           nullptr, nullptr);
+  }
+  for (uint64_t i = 0; i < gSize; i += 1) {
+    buckets[i].buffer = buffer_pool + i % 1024 * Configuration::GetBlockSize();
+    sprintf((char*)buckets[i].buffer, "temp%d", i * 7);
+    gettimeofday(&buckets[i].s, NULL);
+    gRaidController->Write(i * Configuration::GetBlockSize(),
+                           1 * Configuration::GetBlockSize(),
                            buckets[i].buffer,
                            nullptr, nullptr);
   }

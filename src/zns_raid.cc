@@ -67,3 +67,7 @@ extern "C" void zns_raid_set_header_footer(uint32_t enable_header_footer) {
   Configuration::SetEnableHeaderFooter(enable_header_footer);
 }
 
+extern "C" void zns_raid_set_storage_space_in_bytes(uint64_t storage_space_in_bytes) {
+  Configuration::SetStorageSpaceInBytes(storage_space_in_bytes);
+}
+

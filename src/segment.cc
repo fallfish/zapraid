@@ -8,16 +8,6 @@
 uint8_t *Segment::gEncodeMatrix = nullptr;
 uint8_t *Segment::gGfTables = nullptr;
 
-inline uint32_t round_up(uint32_t value, uint32_t align)
-{
-  return (value + align - 1) / align * align;
-}
-
-inline uint32_t round_down(uint32_t value, uint32_t align)
-{
-  return value / align * align;
-}
-
 Segment::Segment(RAIDController *raidController,
                  uint32_t segmentId,
                  RequestContextPool *ctxPool,
@@ -39,8 +29,8 @@ Segment::Segment(RAIDController *raidController,
   }
 
   mRaidController = raidController;
-  mZonePos = 0;
-  mStripePos = 0;
+  mPos = 0;
+  mPosInStripe = 0;
 
   mRequestContextPool = ctxPool;
   mReadContextPool = rctxPool;
@@ -73,25 +63,17 @@ Segment::Segment(RAIDController *raidController,
 
   mNumBlocks = 0;
   mNumInvalidBlocks = 0;
-  mCapacity = Configuration::GetZoneCapacity();
 
-  mValidBits = new bool[mSegmentMeta.n * mCapacity];
-  memset(mValidBits, 0, mSegmentMeta.n * mCapacity);
-  mCompactStripeTable = new uint8_t[mSegmentMeta.n * mCapacity];
-  memset(mCompactStripeTable, 0, mSegmentMeta.n * mCapacity);
-  mProtectedBlockMetadata = new ProtectedBlockMetadata[mSegmentMeta.n * mCapacity];
-  memset(mProtectedBlockMetadata, 0, mSegmentMeta.n * mCapacity);
+  mHeaderRegionSize = raidController->GetHeaderRegionSize();
+  mDataRegionSize = raidController->GetDataRegionSize();
+  mFooterRegionSize = raidController->GetFooterRegionSize();
 
-  if (Configuration::GetEnableHeaderFooter()) {
-    // Adjust the capacity for user data = total capacity - footer size
-    // The L2P table information at the end of the segment
-    // Each block needs (LBA + timestamp, 16 bytes) for L2P table recovery; we round the number to block size
-    mP2LTableSize = round_up(mCapacity * 16, Configuration::GetBlockSize());
-    mInternalCapacity = round_down(mCapacity - mP2LTableSize / Configuration::GetBlockSize(), Configuration::GetSyncGroupSize());
-  } else {
-    mP2LTableSize = 0;
-    mInternalCapacity = mCapacity;
-  }
+  mValidBits = new bool[mSegmentMeta.n * mDataRegionSize];
+  memset(mValidBits, 0, mSegmentMeta.n * mDataRegionSize);
+  mCompactStripeTable = new uint8_t[mSegmentMeta.n * mDataRegionSize];
+  memset(mCompactStripeTable, 0, mSegmentMeta.n * mDataRegionSize);
+  mProtectedBlockMetadata = new ProtectedBlockMetadata[mSegmentMeta.n * mDataRegionSize];
+  memset(mProtectedBlockMetadata, 0, mSegmentMeta.n * mDataRegionSize);
 
   mSegmentStatus = SEGMENT_NORMAL;
 }
@@ -129,11 +111,6 @@ const std::vector<Zone*>& Segment::GetZones()
   return mZones;
 }
 
-uint64_t Segment::GetCapacity() const
-{
-  return mCapacity;
-}
-
 uint64_t Segment::GetNumBlocks() const
 {
   return mNumBlocks;
@@ -146,20 +123,17 @@ uint64_t Segment::GetNumInvalidBlocks() const
 
 bool Segment::IsFull()
 {
-  if (mZonePos == mInternalCapacity) {
-    printf("%d %d\n", mZonePos, mInternalCapacity);
-  }
-  return mZonePos == mInternalCapacity;
+  return mPos == mHeaderRegionSize + mDataRegionSize;
 }
 
 bool Segment::CanSeal()
 {
-  return mZonePos == mInternalCapacity + mP2LTableSize / Configuration::GetBlockSize();
+  return mPos == mHeaderRegionSize + mDataRegionSize + mFooterRegionSize;
 }
 
 void Segment::PrintStats()
 {
-  printf("Zone group position: %d, capacity: %d, num invalid blocks: %d\n", mZonePos, mCapacity, mNumInvalidBlocks);
+  printf("Zone group position: %d, capacity: %d, num invalid blocks: %d\n", mPos, mDataRegionSize, mNumInvalidBlocks);
   for (auto zone : mZones) {
     zone->PrintStats();
   }
@@ -207,27 +181,25 @@ bool Segment::StateTransition()
     }
   }
 
-  if (mSegmentStatus == SEGMENT_PREPARE_NAMED_META) {
+  if (mSegmentStatus == SEGMENT_PREPARE_ZAPRAID) {
     // under SyncPoint, waiting for previous appends
     mStripeWriteContextPool->Recycle();
     if (mStripeWriteContextPool->NoInflightStripes()) {
-      if (Configuration::GetSystemMode() == NAMED_META
-          || Configuration::GetSystemMode() == REDIRECTION) {
+      if (Configuration::GetSystemMode() == ZAPRAID) {
         issueNamedMetadata();
-        mSegmentStatus = SEGMENT_WRITING_NAMED_META;
+        mSegmentStatus = SEGMENT_WRITING_ZAPRAID;
       } else {
         mSegmentStatus = SEGMENT_NORMAL;
       }
       stateChanged = true;
     }
-  } else if (mSegmentStatus == SEGMENT_WRITING_NAMED_META) {
-    if (Configuration::GetSystemMode() == NAMED_META
-        || Configuration::GetSystemMode() == REDIRECTION) {
+  } else if (mSegmentStatus == SEGMENT_WRITING_ZAPRAID) {
+    if (Configuration::GetSystemMode() == ZAPRAID) {
       if (hasNamedMetadataDone()) {
         stateChanged = true;
         mSegmentStatus = SEGMENT_NORMAL;
       }
-    } else if (Configuration::GetSystemMode() == NAMED_GROUP) {
+    } else if (Configuration::GetSystemMode() == GROUP_LAYOUT) {
       mStripeWriteContextPool->Recycle();
       if (mStripeWriteContextPool->NoInflightStripes()) {
         stateChanged = true;
@@ -248,44 +220,39 @@ bool Segment::StateTransition()
     // wait for persisting the stripes
     mStripeWriteContextPool->Recycle();
     if (mStripeWriteContextPool->NoInflightStripes()) {
-      if (!Configuration::GetEnableHeaderFooter()) {
-        mSegmentStatus = SEGMENT_SEALED;
-        Seal();
-      } else {
       // prepare the stripe for writing the footer
-        mCurStripe = mAdminStripe;
-        mCurStripe->targetBytes = mSegmentMeta.stripeSize;
-        for (uint32_t i = 0; i < mSegmentMeta.n; ++i) {
-          RequestContext *slot = mRequestContextPool->getRequestContext(true);
-          slot->data = slot->dataBuffer;
-          slot->meta = slot->metadataBuffer;
-          slot->targetBytes = 4096;
-          slot->type = STRIPE_UNIT;
-          slot->segment = this;
-          slot->ctrl = mRaidController;
-          slot->lba = ~0ull;
-          slot->associatedRequest = nullptr;
-          slot->available = true;
+      mCurStripe = mAdminStripe;
+      mCurStripe->targetBytes = mSegmentMeta.stripeSize;
+      for (uint32_t i = 0; i < mSegmentMeta.n; ++i) {
+        RequestContext *slot = mRequestContextPool->getRequestContext(true);
+        slot->data = slot->dataBuffer;
+        slot->meta = slot->metadataBuffer;
+        slot->targetBytes = 4096;
+        slot->type = STRIPE_UNIT;
+        slot->segment = this;
+        slot->ctrl = mRaidController;
+        slot->lba = ~0ull;
+        slot->associatedRequest = nullptr;
+        slot->available = true;
+        slot->append = false;
 
-          mCurStripe->data[i] = (uint8_t*)slot->data;
-          mCurStripe->ioContext.emplace_back(slot);
+        mCurStripe->data[i] = (uint8_t*)slot->data;
+        mCurStripe->ioContext.emplace_back(slot);
 
-          mSegmentStatus = SEGMENT_WRITING_FOOTER;
-        }
+        mSegmentStatus = SEGMENT_WRITING_FOOTER;
       }
       stateChanged = true;
     }
   } else if (mSegmentStatus == SEGMENT_WRITING_FOOTER) {
     if (checkStripeAvailable(mCurStripe)) {
       if (CanSeal()) {
-        printf("Start seal: %u %u %u\n", mZonePos, mInternalCapacity, mP2LTableSize / Configuration::GetBlockSize());
         stateChanged = true;
         mSegmentStatus = SEGMENT_SEALING;
         Seal();
       } else {
         for (uint32_t i = 0; i < mSegmentMeta.n; ++i) {
           uint32_t zoneId = Configuration::CalculateDiskId(
-              mZonePos, i, (RAIDLevel)mSegmentMeta.raidScheme, mSegmentMeta.numZones);
+              mPos, i, (RAIDLevel)mSegmentMeta.raidScheme, mSegmentMeta.numZones);
           RequestContext *slot = mCurStripe->ioContext[i];
           slot->available = false;
         }
@@ -293,7 +260,6 @@ bool Segment::StateTransition()
           thread_send_msg(mRaidController->GetEcThread(), progressFooterWriter, this);
         } else {
           event_call(Configuration::GetEcThreadCoreId(), progressFooterWriter2, this, nullptr);
-//          event_call(Configuration::GetEcThreadCoreId(), progressFooterWriter2, this, nullptr);
         }
       }
     }
@@ -374,15 +340,19 @@ void Segment::FinalizeSegmentHeader()
 
     mZones[i]->Write(0, Configuration::GetBlockSize(), (void*)slot);
   }
-  mZonePos += 1;
+  mPos += 1;
 }
 
 void Segment::ProgressFooterWriter()
 {
-  uint32_t begin = (mZonePos - mInternalCapacity) * Configuration::GetBlockSize() / 16;
-  uint32_t end = begin + Configuration::GetBlockSize() / 16;
+  // Currently it is the i-th stripe of the footer
+  // 8 bytes for LBA and 8 bytes for timestamp
+  // Each footer block contains blockSize / (8 + 8) entries
+  // Thus the offset in the metadata array is "i * blockSize / 16"
+  uint32_t begin = (mPos - mHeaderRegionSize - mDataRegionSize) * Configuration::GetBlockSize() / 16;
+  uint32_t end = std::min(mDataRegionSize, begin + Configuration::GetBlockSize() / 16);
   for (uint32_t zid = 0; zid < mSegmentMeta.numZones; ++zid) {
-    uint32_t base = zid * mCapacity;
+    uint32_t base = zid * mDataRegionSize;
     uint64_t *footerBlock = reinterpret_cast<uint64_t*>(mCurStripe->data[zid]);
     uint32_t pos = 0;
     for (uint32_t offset = begin; offset < end; ++offset) {
@@ -394,16 +364,16 @@ void Segment::ProgressFooterWriter()
   mCurStripe->successBytes = 0;
   for (uint32_t i = 0; i < mSegmentMeta.n; ++i) {
     uint32_t zoneId = Configuration::CalculateDiskId(
-        mZonePos, i, (RAIDLevel)mSegmentMeta.raidScheme, mSegmentMeta.numZones);
+        mPos, i, (RAIDLevel)mSegmentMeta.raidScheme, mSegmentMeta.numZones);
     RequestContext *slot = mCurStripe->ioContext[i];
     slot->status = WRITE_REAPING;
     slot->successBytes = 0;
-    slot->offset = mZonePos;
+    slot->offset = mPos;
     slot->zoneId = zoneId;
-    mZones[zoneId]->Write(mZonePos, Configuration::GetBlockSize(), (void*)slot);
+    mZones[zoneId]->Write(mPos, Configuration::GetBlockSize(), (void*)slot);
   }
 
-  mZonePos += 1;
+  mPos += 1;
 }
 
 bool Segment::findStripe()
@@ -461,7 +431,7 @@ void generateParityBlock(void *args)
 
 bool Segment::Append(RequestContext *ctx, uint32_t offset)
 {
-  if (mStripePos == 0) {
+  if (mPosInStripe == 0) {
     if (!findStripe()) {
       return false;
     }
@@ -471,7 +441,7 @@ bool Segment::Append(RequestContext *ctx, uint32_t offset)
 
   uint64_t lba = ~0ull;
   uint8_t *blkdata = nullptr;
-  uint32_t whichBlock = mStripePos / Configuration::GetBlockSize();
+  uint32_t whichBlock = mPosInStripe / Configuration::GetBlockSize();
 
   if (ctx != nullptr) {
     lba = ctx->lba + offset;
@@ -479,7 +449,7 @@ bool Segment::Append(RequestContext *ctx, uint32_t offset)
   }
 
   uint32_t zoneId = Configuration::CalculateDiskId(
-      mZonePos, whichBlock,
+      mPos, whichBlock,
       (RAIDLevel)mSegmentMeta.raidScheme, mSegmentMeta.numZones);
   // Issue data block
   {
@@ -494,7 +464,7 @@ bool Segment::Append(RequestContext *ctx, uint32_t offset)
     slot->targetBytes = Configuration::GetBlockSize();
     slot->lba = lba;
     slot->zoneId = zoneId;
-    slot->stripeId = mZonePos % Configuration::GetSyncGroupSize();
+    slot->stripeId = mPos % Configuration::GetSyncGroupSize();
     slot->segment = this;
     slot->ctrl = mRaidController;
     slot->status = WRITE_REAPING;
@@ -506,24 +476,22 @@ bool Segment::Append(RequestContext *ctx, uint32_t offset)
     blkMeta->fields.protectedField.timestamp = 0;
     blkMeta->fields.nonProtectedField.stripeId = slot->stripeId;
 
-    if (mode == NAMED_WRITE) {
+    if (mode == ZONE_WRITE) {
       slot->append = false;
-      slot->offset = mZonePos;
     } else {
       slot->append = true;
-      slot->offset = mZonePos | (Configuration::GetSyncGroupSize() - 1);
     }
 
-     mZones[zoneId]->Write(mZonePos, Configuration::GetStripeUnitSize(), (void*)slot);
+     mZones[zoneId]->Write(mPos, Configuration::GetStripeUnitSize(), (void*)slot);
   }
 
-  mStripePos += Configuration::GetBlockSize();
-  if (mStripePos == mSegmentMeta.stripeDataSize) {
+  mPosInStripe += Configuration::GetBlockSize();
+  if (mPosInStripe == mSegmentMeta.stripeDataSize) {
   // issue parity block
     GenerateParityBlockArgs *args = (GenerateParityBlockArgs*)calloc(1, sizeof(GenerateParityBlockArgs));
     args->segment = this;
     args->stripe = mCurStripe;
-    args->zonePos = mZonePos;
+    args->zonePos = mPos;
 
     if (!Configuration::GetEventFrameworkEnabled()) {
       thread_send_msg(mRaidController->GetEcThread(), generateParityBlock, args);
@@ -532,20 +500,21 @@ bool Segment::Append(RequestContext *ctx, uint32_t offset)
     }
 
 
-    mStripePos = 0;
-    mZonePos += 1;
+    mPosInStripe = 0;
+    mPos += 1;
 
-    if ((mode == NAMED_GROUP || mode == NAMED_META || mode == REDIRECTION)
+    if ((mode == GROUP_LAYOUT || mode == ZAPRAID)
         && needNamedMetadata()) {
       // writing the stripe metadata at the end of each group
-      mSegmentStatus = SEGMENT_PREPARE_NAMED_META;
+      mSegmentStatus = SEGMENT_PREPARE_ZAPRAID;
     }
 
-    if (mode == NAMED_GROUP && mZonePos % Configuration::GetSyncGroupSize() == 0) {
-      mSegmentStatus = SEGMENT_WRITING_NAMED_META;
+    if (mode == GROUP_LAYOUT && (mPos + 1) % Configuration::GetSyncGroupSize() == 0) {
+      // The next stripe is the begin of the next group
+      mSegmentStatus = SEGMENT_WRITING_ZAPRAID;
     }
 
-    if (mZonePos == mInternalCapacity) {
+    if (mPos == mHeaderRegionSize + mDataRegionSize) {
       // writing the P2L table at the end of the segment
       mSegmentStatus = SEGMENT_PREPARE_FOOTER;
     }
@@ -585,7 +554,7 @@ void Segment::GenerateParityBlock(StripeWriteContext *stripe, uint32_t zonePos)
     slot->stripeId = zonePos % Configuration::GetSyncGroupSize();
     slot->status = WRITE_REAPING;
     slot->type = STRIPE_UNIT;
-    if (mode == NAMED_WRITE) {
+    if (mode == ZONE_WRITE) {
       slot->append = false;
     } else {
       slot->append = true;
@@ -645,8 +614,10 @@ bool Segment::ReadValid(RequestContext *ctx, uint32_t pos, PhysicalAddr phyAddr,
   bool success = false;
   uint32_t zoneId = phyAddr.zoneId;
   uint32_t offset = phyAddr.offset;
-
-  if (mValidBits[zoneId * mCapacity + offset] == 0) {
+  if (offset < mHeaderRegionSize || offset >= mHeaderRegionSize + mDataRegionSize) {
+    *isValid = false;
+    success = true;
+  } else if (mValidBits[zoneId * mDataRegionSize + offset - mHeaderRegionSize] == 0) {
     *isValid = false;
     success = true;
   } else {
@@ -770,7 +741,7 @@ void Segment::issueNamedMetadata()
 
   for (int i = 0; i < n; ++i) {
     uint32_t zid = Configuration::CalculateDiskId(
-        mZonePos, i, (RAIDLevel)mSegmentMeta.raidScheme, mSegmentMeta.n);
+        mPos, i, (RAIDLevel)mSegmentMeta.raidScheme, mSegmentMeta.n);
     mCurrentNamedGroupMetadata.slots[i].Clear();
     mCurrentNamedGroupMetadata.slots[i].available = false;
     mCurrentNamedGroupMetadata.slots[i].targetBytes = Configuration::GetBlockSize();
@@ -778,8 +749,8 @@ void Segment::issueNamedMetadata()
     mCurrentNamedGroupMetadata.slots[i].ctrl = mRaidController;
     mCurrentNamedGroupMetadata.slots[i].segment = this;
     mCurrentNamedGroupMetadata.slots[i].zoneId = zid;
-    mCurrentNamedGroupMetadata.slots[i].stripeId = mZonePos % Configuration::GetSyncGroupSize();
-    mCurrentNamedGroupMetadata.slots[i].offset = mZonePos;
+    mCurrentNamedGroupMetadata.slots[i].stripeId = mPos % Configuration::GetSyncGroupSize();
+    mCurrentNamedGroupMetadata.slots[i].offset = mPos;
     mCurrentNamedGroupMetadata.slots[i].type = STRIPE_UNIT;
     mCurrentNamedGroupMetadata.slots[i].status = WRITE_REAPING;
     mCurrentNamedGroupMetadata.slots[i].lba = ~0ull;
@@ -795,14 +766,17 @@ void Segment::issueNamedMetadata()
       meta->fields.protectedField.timestamp = 0;
       meta->fields.nonProtectedField.stripeId = Configuration::GetSyncGroupSize() - 1;
     }
-    mZones[zid]->Write(mZonePos, Configuration::GetBlockSize(), &mCurrentNamedGroupMetadata.slots[i]);
+    mZones[zid]->Write(mPos, Configuration::GetBlockSize(), &mCurrentNamedGroupMetadata.slots[i]);
   }
-  mZonePos += 1;
+  mPos += 1;
 }
 
 bool Segment::needNamedMetadata()
 {
-  return (mZonePos + 1) % Configuration::GetSyncGroupSize() == 0;
+  // We need to issue Zone Write in the next stripe
+  // Due to the header region size, [1, GroupSize] is a group
+  // and the stripe with ID of GroupSize is the Zone Write
+  return mPos % Configuration::GetSyncGroupSize() == 0;
 }
 
 bool Segment::hasNamedMetadataDone()
@@ -829,6 +803,18 @@ void Segment::Reset(RequestContext *ctx)
     context->status = RESET_REAPING;
     mZones[i]->Reset(context);
   }
+}
+
+bool Segment::IsResetDone()
+{
+  bool done = true;
+  for (auto context : mResetContext) {
+    if (!context.available) {
+      done = false;
+      break;
+    }
+  }
+  return done;
 }
 
 void Segment::Seal()
@@ -861,10 +847,14 @@ void Segment::ReadStripeMeta(RequestContext *ctx)
 
   ReadContext *readContext = ctx->associatedRead;
 
-  uint32_t syncPointOffset = offset | (Configuration::GetSyncGroupSize() - 1);
+  // Note that data region begins from offset 1, we need to decrement the offset by 1
+  uint32_t offsetOfLastStripeInRequestedGroup = 
+      ((offset - 1) | (Configuration::GetSyncGroupSize() - 1)) + 1;
+  uint32_t offsetOfLastStripeInCurrentGroup =
+      (mPos | (Configuration::GetSyncGroupSize() - 1)) + 1;
   ctx->successBytes = 0;
 
-  if (syncPointOffset == (mZonePos | (Configuration::GetSyncGroupSize() - 1))) {
+  if (offsetOfLastStripeInCurrentGroup == offsetOfLastStripeInRequestedGroup) {
     ctx->needDecodeMeta = false;
     ctx->targetBytes = n * Configuration::GetBlockSize();
 
@@ -878,7 +868,7 @@ void Segment::ReadStripeMeta(RequestContext *ctx)
       reqCtx->ctrl = mRaidController;
       reqCtx->segment = this;
       reqCtx->zoneId = 0;
-      reqCtx->offset = syncPointOffset;
+      reqCtx->offset = offsetOfLastStripeInRequestedGroup;
       reqCtx->data = reqCtx->dataBuffer;
       reqCtx->meta = reqCtx->metadataBuffer;
 
@@ -908,7 +898,7 @@ void Segment::ReadStripeMeta(RequestContext *ctx)
       reqCtx->ctrl = mRaidController;
       reqCtx->segment = this;
       reqCtx->zoneId = i;
-      reqCtx->offset = syncPointOffset;
+      reqCtx->offset = offsetOfLastStripeInRequestedGroup;
       reqCtx->data = reqCtx->dataBuffer;
       reqCtx->meta = reqCtx->metadataBuffer;
 
@@ -916,7 +906,7 @@ void Segment::ReadStripeMeta(RequestContext *ctx)
       readContext->ioContext.emplace_back(reqCtx);
 
       if ((!isSingleBlock) || (isSingleBlock && cnt == 0)) {
-        mZones[i]->Read(syncPointOffset, Configuration::GetBlockSize(), reqCtx);
+        mZones[i]->Read(reqCtx->offset, Configuration::GetBlockSize(), reqCtx);
       }
 
       cnt++;
@@ -934,12 +924,12 @@ void Segment::ReadStripeMemorySufficient(RequestContext *ctx)
   uint32_t k = Configuration::GetStripeDataSize() / Configuration::GetStripeUnitSize();
   ReadContext *readContext = ctx->associatedRead;
 
-  uint32_t groupId = offset / Configuration::GetSyncGroupSize();
+  uint32_t groupId = (offset - mHeaderRegionSize) / Configuration::GetSyncGroupSize();
   uint32_t searchBegin = groupId * Configuration::GetSyncGroupSize();
-  uint32_t searchEnd = groupId * Configuration::GetSyncGroupSize();
+  uint32_t searchEnd = searchBegin + Configuration::GetSyncGroupSize();
 
   // Find out the stripeId of the requested block
-  uint32_t index = zoneId * mCapacity + offset;
+  uint32_t index = zoneId * mDataRegionSize + offset - mHeaderRegionSize;
   uint8_t  stripeId = mCompactStripeTable[index];
 
   uint32_t realOffsets[n];
@@ -951,7 +941,7 @@ void Segment::ReadStripeMemorySufficient(RequestContext *ctx)
       continue;
     }
     for (uint32_t j = searchBegin; j < searchEnd; ++j) {
-      uint32_t index = i * mCapacity + j;
+      uint32_t index = i * mHeaderRegionSize + j;
       if (mCompactStripeTable[index] == stripeId) {
         if (realOffsets[i] != ~0u) printf("Duplicate stripe ID!\n");
         realOffsets[i] = mCompactStripeTable[index];
@@ -997,15 +987,15 @@ void Segment::ReadStripe(RequestContext *ctx)
   uint32_t k = Configuration::GetStripeDataSize() / Configuration::GetStripeUnitSize();
   ReadContext *readContext = ctx->associatedRead;
 
-  if (mode == NAMED_WRITE || mode == NAMED_META || mode == REDIRECTION) {
+  if (mode == ZONE_WRITE || mode == ZAPRAID) {
     uint32_t realOffsets[n];
     ctx->targetBytes = k * Configuration::GetStripeUnitSize();
     ctx->successBytes = 0;
-    if (mode == NAMED_WRITE) { // PURE_WRITE
+    if (mode == ZONE_WRITE) { // PURE_WRITE
       for (uint32_t i = 0; i < n; ++i) {
         realOffsets[i] = offset;
       }
-    } else if (mode == NAMED_META || mode == REDIRECTION) {
+    } else if (mode == ZAPRAID) {
       // decode metadata
       uint16_t offsetMap[Configuration::GetStripeSize() / 2];
 
@@ -1061,7 +1051,7 @@ void Segment::ReadStripe(RequestContext *ctx)
     for (uint32_t i = 0; i < n && cnt < k; ++i) {
       if (i == zoneId) continue;
       RequestContext *reqCtx = nullptr;
-      if (Configuration::GetSystemMode() == NAMED_WRITE) {
+      if (Configuration::GetSystemMode() == ZONE_WRITE) {
         reqCtx = mRequestContextPool->getRequestContext(true);
         readContext->ioContext.emplace_back(reqCtx);
       } else {
@@ -1085,7 +1075,7 @@ void Segment::ReadStripe(RequestContext *ctx)
 
       ++cnt;
     }
-  } else if (mode == NAMED_GROUP) {
+  } else if (mode == GROUP_LAYOUT) {
     // Note that the sync group size must be small to prevent from overwhelming the storage
     ctx->targetBytes = k * Configuration::GetStripeUnitSize() * Configuration::GetSyncGroupSize();
     ctx->successBytes = 0;
@@ -1114,7 +1104,7 @@ void Segment::ReadStripe(RequestContext *ctx)
     }
   }
 
-  if (mode == NAMELESS_WRITE) {
+  if (mode == ZONE_APPEND) {
     fprintf(stderr, "Pure zone append does not support recovery.\n");
     exit(-1);
   }
@@ -1122,15 +1112,22 @@ void Segment::ReadStripe(RequestContext *ctx)
 
 void Segment::WriteComplete(RequestContext *ctx)
 {
-  uint32_t index = ctx->zoneId * mCapacity + ctx->offset;
+  if (ctx->offset < mHeaderRegionSize ||
+      ctx->offset >= mHeaderRegionSize + mDataRegionSize) {
+    return;
+  }
+
+  uint32_t index = ctx->zoneId * mDataRegionSize + ctx->offset - mHeaderRegionSize;
   if (Configuration::GetDeviceSupportMetadata()) {
     // Note that here the (lba, timestamp, stripeId) is not the one written to flash page
-    // Thus the lba and timestamp is "INVALID" for parity block, and the footer is valid
+    // Thus the lba and timestamp is "INVALID" for parity block, and the footer
+    // (which uses this field to fill) is valid
     ProtectedBlockMetadata &pbm = mProtectedBlockMetadata[index];
     pbm.lba = ctx->lba;
     pbm.timestamp = ctx->timestamp;
   }
   mCompactStripeTable[index] = ctx->stripeId;
+  FinishBlock(ctx->zoneId, ctx->offset, ctx->lba);
 }
 
 void Segment::ReadComplete(RequestContext *ctx)
@@ -1152,7 +1149,7 @@ void Segment::ReadComplete(RequestContext *ctx)
       alive[i] = false;
     }
 
-    if (Configuration::GetSystemMode() == NAMED_GROUP) {
+    if (Configuration::GetSystemMode() == GROUP_LAYOUT) {
       for (uint32_t i = 1; i < readContext->ioContext.size(); ++i) {
         RequestContext *reqCtx = readContext->ioContext[i];
         BlockMetadata *metadata = (BlockMetadata*)reqCtx->meta;
@@ -1174,7 +1171,7 @@ void Segment::ReadComplete(RequestContext *ctx)
 
   if (!Configuration::GetDeviceSupportMetadata()) {
     BlockMetadata *meta = (BlockMetadata*)ctx->meta;
-    uint32_t index = zoneId * mCapacity + offset;
+    uint32_t index = zoneId * mDataRegionSize + offset - mHeaderRegionSize;
     meta->fields.protectedField.lba = mProtectedBlockMetadata[index].lba;
     meta->fields.protectedField.timestamp = mProtectedBlockMetadata[index].timestamp;
     meta->fields.nonProtectedField.stripeId = mCompactStripeTable[index];
@@ -1190,23 +1187,18 @@ void Segment::ReadComplete(RequestContext *ctx)
   }
 }
 
-uint32_t Segment::GetZoneSize()
-{
-  return mCapacity;
-}
-
 void Segment::InvalidateBlock(uint32_t zoneId, uint32_t realOffset)
 {
   assert(mNumInvalidBlocks < mNumBlocks);
   mNumInvalidBlocks += 1;
-  mValidBits[zoneId * mCapacity + realOffset] = false;
+  mValidBits[zoneId * mDataRegionSize + realOffset - mHeaderRegionSize] = false;
 }
 
 void Segment::FinishBlock(uint32_t zoneId, uint32_t offset, uint64_t lba)
 {
   if (lba != ~0ull) {
     mNumBlocks += 1;
-    mValidBits[zoneId * mCapacity + offset] = true;
+    mValidBits[zoneId * mDataRegionSize + offset - mHeaderRegionSize] = true;
   }
 }
 
@@ -1214,17 +1206,6 @@ void Segment::ReleaseZones()
 {
   for (auto zone : mZones) {
     zone->Release();
-  }
-}
-
-void Segment::FlushStripe()
-{
-  if (mStripePos == 0) return;
-  SystemMode mode = Configuration::GetSystemMode();
-
-  for ( ; mStripePos < Configuration::GetStripeDataSize();
-      mStripePos += Configuration::GetBlockSize()) {
-    Append(nullptr, 0);
   }
 }
 
@@ -1242,4 +1223,9 @@ bool Segment::CheckOutstandingRead()
 uint32_t Segment::GetSegmentId()
 {
   return mSegmentMeta.segmentId;
+}
+
+uint64_t Segment::GetCapacity() const
+{
+  return mDataRegionSize;
 }

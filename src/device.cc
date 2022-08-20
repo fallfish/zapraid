@@ -94,8 +94,7 @@ void Device::Init(struct spdk_nvme_ctrlr *ctrlr, int nsid)
 
   mZoneSize = spdk_nvme_zns_ns_get_zone_size_sectors(mNamespace);
   mNumZones = spdk_nvme_zns_ns_get_num_zones(mNamespace);
-  mZoneCapacity = 1077 * 1024 / 4; // 1,077 * 1024 * 1024 / 4096;
-  Configuration::SetZoneCapacity(mZoneCapacity);
+  mZoneCapacity = 256 * 1024 / 4; // 1,077 * 1024 * 1024 / 4096;
   printf("Zone size: %d, zone cap: %d, num of zones: %d\n", mZoneSize, mZoneCapacity, mNumZones);
 
   struct spdk_nvme_io_qpair_opts opts;
@@ -104,7 +103,6 @@ void Device::Init(struct spdk_nvme_ctrlr *ctrlr, int nsid)
   opts.create_only = true;
   mIoQueues = new struct spdk_nvme_qpair*[Configuration::GetNumIoThreads()];
   for (int i = 0; i < Configuration::GetNumIoThreads(); ++i) {
-    mIoQueues[i] = nullptr;
     mIoQueues[i] = spdk_nvme_ctrlr_alloc_io_qpair(ctrlr, &opts, sizeof(opts));
     assert(mIoQueues[i]);
   }
@@ -134,13 +132,22 @@ void Device::EraseWholeDevice()
   }
 }
 
-void Device::InitZones()
+void Device::InitZones(uint32_t numNeededZones, uint32_t numReservedZones)
 {
+  if (numNeededZones + numReservedZones > mNumZones) {
+    printf("Warning! The real storage space is not sufficient for the setting, %u %u %u\n", numNeededZones, numReservedZones, mNumZones);
+  }
+  mNumZones = std::min(mNumZones, numNeededZones + numReservedZones);
   mZones = new Zone[mNumZones];
   for (int i = 0; i < mNumZones; ++i) {
     mZones[i].Init(this, i * mZoneSize, mZoneCapacity, mZoneSize);
     mAvailableZones.emplace_back(&mZones[i]);
   }
+}
+
+bool Device::HasAvailableZone()
+{
+  return !mAvailableZones.empty();
 }
 
 Zone* Device::OpenZone()
@@ -152,6 +159,13 @@ Zone* Device::OpenZone()
   mAvailableZones.pop_back();
 
   return zone;
+}
+
+void Device::ReturnZone(Zone* zone)
+{
+
+  mUsedZones.erase(zone->GetSlba());
+  mAvailableZones.emplace_back(zone);
 }
 
 void Device::issueIo2(spdk_event_fn event_fn, RequestContext *slot)
@@ -185,9 +199,6 @@ void Device::ResetZone(Zone* zone, void *ctx)
   } else {
     issueIo(zoneReset, slot);
   }
-
-  mUsedZones.erase(zone->GetSlba());
-  mAvailableZones.emplace_back(zone);
 }
 
 void Device::FinishZone(Zone *zone, void *ctx)
@@ -287,6 +298,11 @@ void Device::AddAvailableZone(Zone *zone)
 {
   assert(mUsedZones.find(zone->GetSlba()) != mUsedZones.end());
   mAvailableZones.push_back(zone);
+}
+
+uint64_t Device::GetZoneCapacity()
+{
+  return mZoneCapacity;
 }
 
 uint32_t Device::GetNumZones()

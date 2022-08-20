@@ -1,6 +1,6 @@
 enum SystemMode {
-  NAMED_WRITE, NAMELESS_WRITE,
-  NAMED_GROUP, NAMED_META, REDIRECTION
+  ZONE_WRITE, ZONE_APPEND,
+  GROUP_LAYOUT, ZAPRAID
 };
 
 enum RAIDLevel {
@@ -174,6 +174,10 @@ public:
     return GetInstance().gIsBrandNew;
   }
 
+  static uint32_t GetReceiverThreadCoreId() {
+    return GetInstance().gReceiverThreadCoreId;
+  }
+
   static uint32_t GetEcThreadCoreId() {
     return GetInstance().gEcThreadCoreId;
   }
@@ -192,6 +196,14 @@ public:
 
   static uint32_t GetIoThreadCoreId(uint32_t thread_id) {
     return GetInstance().gIoThreadCoreIdBase + thread_id;
+  }
+
+  static void SetStorageSpaceInBytes(uint64_t storageSpaceInBytes) {
+    GetInstance().gStorageSpaceInBytes = storageSpaceInBytes;
+  }
+
+  static uint64_t GetStorageSpaceInBytes() {
+    return GetInstance().gStorageSpaceInBytes;
   }
 
   static uint32_t CalculateDiskId(uint32_t stripeId, uint32_t whichBlock, RAIDLevel raidScheme, uint32_t numDisks) {
@@ -238,8 +250,8 @@ public:
 private:
   bool gIsBrandNew = true;
 
-  int gStripeSize = 4096 * 4;
-  int gStripeDataSize = 4096 * 3;
+  int gStripeSize = 4096 * 3;
+  int gStripeDataSize = 4096 * 2;
   int gStripeParitySize = 4096 * 1;
   int gStripeUnitSize = 4096 * 1;
   int gStripeBlockSize = 4096;
@@ -249,20 +261,22 @@ private:
   bool gDeviceSupportMetadata = true;
   int gZoneCapacity = 0;
   int gStripePersistencyMode = 0;
-  bool gEnableGc = false;
+  bool gEnableGc = true;
   int gSyncGroupSize = 512;
   bool gEnableDegradedRead = false;
   uint32_t gNumOpenSegments = 1;
   RAIDLevel gRaidScheme = RAID5;
   bool gEnableHeaderFooter = true;
 
-  SystemMode gSystemMode = NAMED_WRITE;
-  // 0: Pure write; 1: Pure zone append; 2: Zone append without metadata; 3: Zone append with metadata; 4: Zone append with redirection
+  uint64_t gStorageSpaceInBytes = 8 * 1024 * 1024 * 1024ull;
 
-  uint32_t gIndexThreadCoreId = 4;
-  uint32_t gDispatchThreadCoreId = 5;
-  uint32_t gCompletionThreadCoreId = 6;
+  SystemMode gSystemMode = ZAPRAID;
+
+  uint32_t gReceiverThreadCoreId = 2;
+  uint32_t gDispatchThreadCoreId = 3;
+  uint32_t gCompletionThreadCoreId = 4;
+  uint32_t gIndexThreadCoreId = 5;
+  uint32_t gEcThreadCoreId = 6;
   uint32_t gIoThreadCoreIdBase = 7;
-  uint32_t gEcThreadCoreId = 8;
 };
 

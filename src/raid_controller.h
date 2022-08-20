@@ -46,6 +46,9 @@ public:
    */
   void Read(uint64_t offset, uint32_t size, void *data, zns_raid_request_complete cb_fn, void *cb_args);
 
+  void Execute(uint64_t offset, uint32_t size, void* data, bool is_write,
+      zns_raid_request_complete cb_fn, void *cb_args);
+
   /**
    * @brief Drain the RAID system to finish all the in-flight requests
    */
@@ -121,13 +124,18 @@ public:
    * @return false the queried block was not written before or was trimmed
    */
   bool LookupIndex(uint64_t lba, PhysicalAddr *phyAddr);
+
   void ReclaimContexts();
   void Flush();
-  GcTask* GetGcTask();
 
+  GcTask* GetGcTask();
+  uint32_t GetHeaderRegionSize();
+  uint32_t GetDataRegionSize();
+  uint32_t GetFooterRegionSize();
+
+  void RemoveRequestFromGcEpochIfNecessary(RequestContext *ctx);
 private:
   RequestContext* getContextForUserRequest();
-  void doExecute(uint64_t offset, uint32_t size, void* data, bool is_write, zns_raid_request_complete cb_fn, void *cb_args);
   void doWrite(RequestContext *context);
   void doRead(RequestContext *context);
   
@@ -180,12 +188,19 @@ private:
 
   std::vector<RequestContext*> mEventsToDispatch;
 
-  uint32_t mNumAvailableZones = 0;
+  uint32_t mAvailableStorageSpaceInSegments = 0;
+  uint32_t mStorageSpaceThresholdForGcInSegments = 0;
   uint32_t mNumTotalZones = 0;
 
   uint32_t mNextAppendOpenSegment = 0;
   uint32_t mNextAssignedSegmentId = 0;
   uint32_t mGlobalTimestamp = 0;
+
+  uint32_t mHeaderRegionSize = 0;
+  uint32_t mDataRegionSize = 0;
+  uint32_t mFooterRegionSize = 0;
+
+  std::unordered_set<RequestContext*> mReadsInCurrentGcEpoch;
 };
 
 #endif
