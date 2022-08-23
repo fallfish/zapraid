@@ -147,7 +147,6 @@ private:
   void initGc();
 
   void createSegmentIfNeeded(Segment **segment, uint32_t spId);
-  void sealSegmentIfNeeded(Segment **segment);
   bool scheduleGc();
 
   void initializeGcTask();

@@ -110,8 +110,8 @@ public:
   void Seal();
 
   uint64_t GetCapacity() const;
-  uint64_t GetNumBlocks() const;
-  uint64_t GetNumInvalidBlocks() const;
+  uint32_t GetNumBlocks() const;
+  uint32_t GetNumInvalidBlocks() const;
   uint32_t GetSegmentId();
   uint32_t GetZoneSize();
 
@@ -140,6 +140,8 @@ public:
   void FinishBlock(uint32_t zoneId, uint32_t realOffset, uint64_t lba);
   void PrintStats();
 
+  void ReclaimReadContext(ReadContext *context);
+
   bool StateTransition();
   SegmentStatus GetStatus();
   void ReleaseZones();
@@ -161,8 +163,8 @@ private:
   void recycleStripeWriteContexts();
   void recycleReadContexts();
   void recycleContexts();
-  RequestContext* getRequestContext();
-  void returnRequestContext(RequestContext *slot);
+  RequestContext* GetRequestContext();
+  void ReturnRequestContext(RequestContext *slot);
   bool checkStripeAvailable(StripeWriteContext *stripeContext);
   bool checkReadAvailable(ReadContext *stripeContext);
   bool findStripe();
@@ -173,8 +175,6 @@ private:
   bool needNamedMetadata();
   bool hasNamedMetadataDone();
   
-//   std::vector<bool> mValidBits;
-//   std::vector<BlockMetadata> mBlockMetadata;
   bool* mValidBits;
   uint8_t* mCompactStripeTable;
   // if the backend support _with_md commands, then this is not used.

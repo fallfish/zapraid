@@ -7,7 +7,9 @@
 #include <rte_errno.h>
 
 //  uint32_t gSize = 128 * 1024 * 1024ull / Configuration::GetBlockSize();
-uint32_t gSize = 4 * 1024 * 1024 * 1024ull / Configuration::GetBlockSize();
+uint32_t gSize = 8 * 1024 * 1024 * 1024ull / Configuration::GetBlockSize();
+uint32_t numLoops = 3;
+uint32_t numBuffers = 1024 * 128;
 
 RAIDController *gRaidController;
 uint8_t *buffer_pool;
@@ -43,18 +45,18 @@ void validate()
   struct timeval s, e;
   gettimeofday(&s, NULL);
 //  Configuration::SetEnableDegradedRead(true);
-  for (uint64_t i = 0; i < gSize; ++i) {
+  for (uint64_t i = 0; i < gSize / 10; ++i) {
     LatencyBucket b;
     gettimeofday(&b.s, NULL);
     bool done;
     done = false;
-    gRaidController->Read(i * Configuration::GetBlockSize(), Configuration::GetBlockSize(), readValidateBuffer + i % 1024 * Configuration::GetBlockSize(), setdone, &done);
+    gRaidController->Read(i * Configuration::GetBlockSize(), Configuration::GetBlockSize(), readValidateBuffer + i % numBuffers * Configuration::GetBlockSize(), setdone, &done);
     while (!done) {
       std::this_thread::yield();
     //  std::this_thread::sleep_for(std::chrono::seconds(0));
     }
     sprintf(buffer, "temp%d", i * 7);
-    if (strcmp(buffer, (char*)readValidateBuffer + i % 1024 * Configuration::GetBlockSize()) != 0) {
+    if (strcmp(buffer, (char*)readValidateBuffer + i % numBuffers * Configuration::GetBlockSize()) != 0) {
       printf("Mismatch %d\n", i);
       assert(0);
       break;
@@ -97,29 +99,22 @@ int main(int argc, char *argv[])
   buckets = new LatencyBucket[gSize];
   
   buffer_pool = (uint8_t*)spdk_zmalloc(
-      16384 * Configuration::GetBlockSize(), 4096,
+      numBuffers * Configuration::GetBlockSize(), 4096,
       NULL, SPDK_ENV_SOCKET_ID_ANY,
       SPDK_MALLOC_DMA);
   struct timeval s, e;
   gettimeofday(&s, NULL);
-  for (uint64_t i = 0; i < gSize; i += 1) {
-    buckets[i].buffer = buffer_pool + i % 1024 * Configuration::GetBlockSize();
-    sprintf((char*)buckets[i].buffer, "temp%d", i * 7);
-    gettimeofday(&buckets[i].s, NULL);
-//    gRaidController->Write(i * Configuration::GetBlockSize(), Configuration::GetBlockSize(), buckets[i].buffer, latency_puncher, &buckets[i]);
-    gRaidController->Write(i * Configuration::GetBlockSize(),
-                           1 * Configuration::GetBlockSize(),
-                           buckets[i].buffer,
-                           nullptr, nullptr);
-  }
-  for (uint64_t i = 0; i < gSize; i += 1) {
-    buckets[i].buffer = buffer_pool + i % 1024 * Configuration::GetBlockSize();
-    sprintf((char*)buckets[i].buffer, "temp%d", i * 7);
-    gettimeofday(&buckets[i].s, NULL);
-    gRaidController->Write(i * Configuration::GetBlockSize(),
-                           1 * Configuration::GetBlockSize(),
-                           buckets[i].buffer,
-                           nullptr, nullptr);
+  for (int loop = 0; loop < numLoops; ++loop) {
+    for (uint64_t i = 0; i < gSize; i += loop + 1) {
+      buckets[i].buffer = buffer_pool + i % numBuffers * Configuration::GetBlockSize();
+      sprintf((char*)buckets[i].buffer, "temp%d", i * 7);
+      gettimeofday(&buckets[i].s, NULL);
+  //    gRaidController->Write(i * Configuration::GetBlockSize(), Configuration::GetBlockSize(), buckets[i].buffer, latency_puncher, &buckets[i]);
+      gRaidController->Write(i * Configuration::GetBlockSize(),
+                             1 * Configuration::GetBlockSize(),
+                             buckets[i].buffer,
+                             nullptr, nullptr);
+    }
   }
   gRaidController->Drain();
 

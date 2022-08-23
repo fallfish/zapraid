@@ -94,7 +94,7 @@ void Device::Init(struct spdk_nvme_ctrlr *ctrlr, int nsid)
 
   mZoneSize = spdk_nvme_zns_ns_get_zone_size_sectors(mNamespace);
   mNumZones = spdk_nvme_zns_ns_get_num_zones(mNamespace);
-  mZoneCapacity = 256 * 1024 / 4; // 1,077 * 1024 * 1024 / 4096;
+  mZoneCapacity = 1077 * 256;
   printf("Zone size: %d, zone cap: %d, num of zones: %d\n", mZoneSize, mZoneCapacity, mNumZones);
 
   struct spdk_nvme_io_qpair_opts opts;

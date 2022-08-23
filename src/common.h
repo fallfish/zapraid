@@ -248,8 +248,8 @@ struct RequestContextPool {
   uint32_t capacity;
 
   RequestContextPool(uint32_t cap);
-  RequestContext *getRequestContext(bool force);
-  void returnRequestContext(RequestContext *slot);
+  RequestContext *GetRequestContext(bool force);
+  void ReturnRequestContext(RequestContext *slot);
 };
 
 struct ReadContextPool {
@@ -262,6 +262,7 @@ struct ReadContextPool {
   ReadContextPool(uint32_t cap, RequestContextPool *rp);
   ReadContext* GetContext();
   void Recycle();
+  void ReturnContext(ReadContext *readContext);
 private:
   bool checkReadAvailable(ReadContext *readContext);
 };

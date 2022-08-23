@@ -166,12 +166,15 @@ void RAIDController::Init(bool need_env)
   mDataRegionSize = round_down(zoneCapacity - mHeaderRegionSize - maxFooterSize,
                                Configuration::GetSyncGroupSize());
   mFooterRegionSize = round_up(mDataRegionSize * 16, blockSize) / blockSize;
+  printf("HeaderRegion: %u, DataRegion: %u, FooterRegion: %u\n",
+         mHeaderRegionSize, mDataRegionSize, mFooterRegionSize);
 
   uint32_t totalNumZones = round_up(Configuration::GetStorageSpaceInBytes() /
                                     Configuration::GetBlockSize(),
                                     mDataRegionSize) / mDataRegionSize;
-  uint32_t numZonesNeededPerDevice = round_up(totalNumZones, mDevices.size()) / mDevices.size();
-  uint32_t numZonesReservedPerDevice = std::max(3u, (uint32_t)(numZonesNeededPerDevice * 0.1));
+  uint32_t numDataBlocks =  Configuration::GetStripeDataSize() / Configuration::GetStripeUnitSize();
+  uint32_t numZonesNeededPerDevice = round_up(totalNumZones, numDataBlocks) / numDataBlocks;
+  uint32_t numZonesReservedPerDevice = std::max(3u, (uint32_t)(numZonesNeededPerDevice * 0.25));
 
   for (uint32_t i = 0; i < mDevices.size(); ++i) {
     mDevices[i]->SetDeviceId(i);
@@ -186,7 +189,7 @@ void RAIDController::Init(bool need_env)
   mRequestContextPoolForUserRequests = new RequestContextPool(256);
   mRequestContextPoolForSegments = new RequestContextPool(4096 * 2);
 
-  mReadContextPool = new ReadContextPool(256, mRequestContextPoolForSegments);
+  mReadContextPool = new ReadContextPool(4096, mRequestContextPoolForSegments);
 
   // Initialize address map
   mAddressMap = new std::unordered_map<uint64_t, PhysicalAddr>();
@@ -253,7 +256,6 @@ void RAIDController::Init(bool need_env)
       mStripeWriteContextPools[i] = new StripeWriteContextPool(1, mRequestContextPoolForSegments);
     } else {
       mStripeWriteContextPools[i] = new StripeWriteContextPool(64, mRequestContextPoolForSegments);
-      printf("%d %p\n", i, mStripeWriteContextPools[i]);
     }
   }
 
@@ -310,13 +312,15 @@ uint32_t RAIDController::GcBatchUpdateIndex(
     uint64_t lba = lbas[i];
     PhysicalAddr oldPba = pbas[i].first;
     PhysicalAddr newPba = pbas[i].second;
-    
+
     if (mAddressMap->find(lba) == mAddressMap->end()) {
-      printf("%lu\n", lba);
+      printf("Missing old lba %lu\n", lba);
     }
     if ((mAddressMap->find(lba))->second == oldPba) {
       numSuccessUpdates += 1;
       UpdateIndex(lba, newPba);
+    } else {
+      newPba.segment->InvalidateBlock(newPba.zoneId, newPba.offset);
     }
   }
   return numSuccessUpdates;
@@ -325,14 +329,17 @@ uint32_t RAIDController::GcBatchUpdateIndex(
 void RAIDController::UpdateIndex(uint64_t lba, PhysicalAddr pba)
 {
   // Invalidate the old block
+  if (lba >= Configuration::GetStorageSpaceInBytes()) {
+    printf("Error\n");
+    assert(0);
+  }
   if (mAddressMap->find(lba) != mAddressMap->end()) {
     PhysicalAddr oldPba = (*mAddressMap)[lba];
-    oldPba.segment->InvalidateBlock(pba.zoneId, pba.offset);
+    oldPba.segment->InvalidateBlock(oldPba.zoneId, oldPba.offset);
     mNumInvalidBlocks += 1;
   }
   assert(pba.segment != nullptr);
   (*mAddressMap)[lba] = pba;  
-//  printf("Update lba %lu with pba %p %u %u\n", lba, pba.segment, pba.zoneId, pba.offset);
   mNumBlocks += 1;
 }
 
@@ -383,7 +390,7 @@ void RAIDController::ReclaimContexts()
             it != mInflightRequestContext.end(); ) {
     if ((*it)->available) {
       (*it)->Clear();
-      mRequestContextPoolForUserRequests->returnRequestContext(*it);
+      mRequestContextPoolForUserRequests->ReturnRequestContext(*it);
       it = mInflightRequestContext.erase(it);
     } else {
       ++it;
@@ -400,7 +407,7 @@ void RAIDController::Flush()
               it != mInflightRequestContext.end(); ) {
       if ((*it)->available) {
         (*it)->Clear();
-        mRequestContextPoolForUserRequests->returnRequestContext(*it);
+        mRequestContextPoolForUserRequests->ReturnRequestContext(*it);
         it = mInflightRequestContext.erase(it);
       } else {
         if ((*it)->req_type == 'W') {
@@ -414,10 +421,10 @@ void RAIDController::Flush()
 
 RequestContext* RAIDController::getContextForUserRequest()
 {
-  RequestContext *ctx = mRequestContextPoolForUserRequests->getRequestContext(false);
+  RequestContext *ctx = mRequestContextPoolForUserRequests->GetRequestContext(false);
   while (ctx == nullptr) {
     ReclaimContexts();
-    ctx = mRequestContextPoolForUserRequests->getRequestContext(false);
+    ctx = mRequestContextPoolForUserRequests->GetRequestContext(false);
   }
 
   mInflightRequestContext.insert(ctx);
@@ -448,8 +455,6 @@ void RAIDController::Execute(
     ctx->status = READ_PREPARE;
   }
 
-  // printf("PointA: %p\n", ctx);
-//  gettimeofday(&ctx->timeA, NULL);
   if (!Configuration::GetEventFrameworkEnabled()) {
     thread_send_msg(mDispatchThread, enqueueRequest, ctx);
   } else {
@@ -470,13 +475,14 @@ void RAIDController::WriteInDispatchThread(RequestContext *ctx)
   uint32_t blockSize = Configuration::GetBlockSize();
   uint32_t curOffset = ctx->curOffset;
   uint32_t size = ctx->size;
-  uint32_t pos = curOffset;
+  uint32_t numBlocks = size / blockSize;
+
   if (curOffset == 0 && ctx->timestamp == ~0ull) {
     ctx->timestamp = mGlobalTimestamp++;
-    ctx->pbaArray.resize(size / blockSize);
+    ctx->pbaArray.resize(numBlocks);
   }
 
-  for ( ; pos < size; pos += blockSize) {
+  for (uint32_t pos = ctx->curOffset; pos < numBlocks; pos += 1) {
     uint32_t openGroupId = mNextAppendOpenSegment;
     mNextAppendOpenSegment = (openGroupId + 1) % mNumOpenSegments;
     bool success = false;
@@ -484,7 +490,6 @@ void RAIDController::WriteInDispatchThread(RequestContext *ctx)
     for (uint32_t trys = 0; trys < mNumOpenSegments; trys += 1) {
       success = mOpenSegments[openGroupId]->Append(ctx, pos);
       if (mOpenSegments[openGroupId]->IsFull()) {
-        printf("Going to open a new segment!\n");
         mSegmentsToSeal.emplace_back(mOpenSegments[openGroupId]);
         mOpenSegments[openGroupId] = nullptr;
         createSegmentIfNeeded(&mOpenSegments[openGroupId], openGroupId);
@@ -496,11 +501,11 @@ void RAIDController::WriteInDispatchThread(RequestContext *ctx)
     }
 
     if (!success) {
+      ctx->curOffset = pos;
       EnqueueEvent(ctx);
-      break;
+      return;
     }
   }
-  ctx->curOffset = pos;
 }
 
 bool RAIDController::LookupIndex(uint64_t lba, PhysicalAddr *pba)
@@ -508,9 +513,7 @@ bool RAIDController::LookupIndex(uint64_t lba, PhysicalAddr *pba)
   auto it = mAddressMap->find(lba);
   if (it != mAddressMap->end()) {
     *pba = it->second;
-    if (lba == 0) {
-      printf("Lookup lba %lu with (*pba) %p %u %u\n", lba, (*pba).segment, (*pba).zoneId, (*pba).offset);
-    }
+//      printf("Lookup lba %lu with (*pba) %p %u %u\n", lba, (*pba).segment, (*pba).zoneId, (*pba).offset);
     return true;
   } else {
     pba->segment = nullptr;
@@ -540,7 +543,7 @@ void RAIDController::ReadInDispatchThread(RequestContext *ctx)
     }
   } else if (ctx->status == READ_INDEX_READY) {
     ctx->status = READ_REAPING;
-    for (uint32_t i = 0; i < numBlocks; ++i) {
+    for (uint32_t i = ctx->curOffset; i < numBlocks; ++i) {
       Segment *segment = ctx->pbaArray[i].segment;
       if (segment == nullptr) {
         uint8_t *block = (uint8_t *)data + i * Configuration::GetBlockSize();
@@ -550,7 +553,11 @@ void RAIDController::ReadInDispatchThread(RequestContext *ctx)
           ctx->Queue();
         }
       } else {
-        segment->Read(ctx, i * Configuration::GetBlockSize(), ctx->pbaArray[i]);
+        if (!segment->Read(ctx, i, ctx->pbaArray[i])) {
+          ctx->curOffset = i;
+          EnqueueEvent(ctx);
+          break;
+        }
       }
     }
   }
@@ -576,10 +583,10 @@ bool RAIDController::scheduleGc()
       return score1 > score2;
       });
 
-  for (uint32_t i = 0; i < groups.size(); ++i) {
-    printf("Score: %f\n", (double)groups[i]->GetNumInvalidBlocks() / groups[i]->GetNumBlocks());
-  }
   mGcTask.inputSegment = groups[0];
+  printf("Select: %p, Score: %f, Invalid: %u, Valid: %u\n", mGcTask.inputSegment,
+      (double)groups[0]->GetNumInvalidBlocks() / groups[0]->GetNumBlocks(),
+      groups[0]->GetNumInvalidBlocks(), groups[0]->GetNumBlocks());
 
   mSealedSegments.erase(std::find(mSealedSegments.begin(), mSealedSegments.end(), groups[0]));
 
@@ -705,18 +712,9 @@ void RAIDController::createSegmentIfNeeded(Segment **segment, uint32_t spId)
     seg->AddZone(zone);
   }
   seg->FinalizeCreation();
-
   *segment = seg;
-}
 
-void RAIDController::sealSegmentIfNeeded(Segment **segment)
-{
-  if ((*segment)->IsFull()) {
-    printf("Seal old zone group: %p\n", *segment);
-//    (*segment)->Seal();
-    mSealedSegments.emplace_back(*segment);
-    *segment = nullptr;
-  }
+  printf("Open segment %p\n", *segment);
 }
 
 std::queue<RequestContext*>& RAIDController::GetRequestQueue()
@@ -810,19 +808,21 @@ bool RAIDController::progressGcReader()
 
     nextReader->available = false;
     nextReader->lba = 0;
+
+    bool valid = false;
+    bool success = true;
     if (mGcTask.curZoneId != mGcTask.maxZoneId) {
       nextReader->req_type = 'R';
       nextReader->status = READ_REAPING;
       nextReader->successBytes = 0;
 
-      bool valid = false;
       do {
         nextReader->segment = mGcTask.inputSegment;
         nextReader->zoneId = mGcTask.curZoneId;
         nextReader->offset = mGcTask.nextOffset;
 
-        mGcTask.inputSegment->ReadValid(
-            nextReader, 0, nextReader->GetPba(), &valid);
+        success = mGcTask.inputSegment->ReadValid(nextReader, 0, nextReader->GetPba(), &valid);
+        if (!success) break;
 
         mGcTask.nextOffset += 1;
         if (mGcTask.nextOffset == mHeaderRegionSize + mDataRegionSize) {
@@ -830,9 +830,9 @@ bool RAIDController::progressGcReader()
           mGcTask.curZoneId += 1;
         }
       } while (!valid && mGcTask.curZoneId != mGcTask.maxZoneId);
-//      if (valid) {
-//        printf("%p %u %u\n", nextReader->segment, nextReader->zoneId, nextReader->offset);
-//      }
+    }
+    if (!success) {
+      break;
     }
     mGcTask.readerPos = (mGcTask.readerPos + 1) % 8;
     nextReader = &mGcTask.contextPool[mGcTask.readerPos];
@@ -910,9 +910,9 @@ bool RAIDController::CheckSegments()
   {
     stateChanged |= (*it)->StateTransition();
     if ((*it)->GetStatus() == SEGMENT_SEALED) {
-      printf("Sealed!\n");
-      it = mSegmentsToSeal.erase(it);
+      printf("Sealed, put %p to the sealed segment!\n", (*it));
       mSealedSegments.push_back(*it);
+      it = mSegmentsToSeal.erase(it);
     } else {
       ++it;
     }

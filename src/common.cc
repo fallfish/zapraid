@@ -157,7 +157,7 @@ RequestContextPool::RequestContextPool(uint32_t cap) {
   }
 }
 
-RequestContext *RequestContextPool::getRequestContext(bool force) {
+RequestContext *RequestContextPool::GetRequestContext(bool force) {
   RequestContext *ctx = nullptr;
   if (availableContexts.empty() && force == false) {
     ctx = nullptr;
@@ -185,7 +185,7 @@ RequestContext *RequestContextPool::getRequestContext(bool force) {
   return ctx;
 }
 
-void RequestContextPool::returnRequestContext(RequestContext *slot) {
+void RequestContextPool::ReturnRequestContext(RequestContext *slot) {
   assert(slot->available);
   if (slot < contexts || slot >= contexts + capacity) {
   // test whether the returned slot is pre-allocated
@@ -216,13 +216,12 @@ ReadContextPool::ReadContextPool(uint32_t cap, RequestContextPool *rp) {
 }
 
 ReadContext* ReadContextPool::GetContext() {
-  while (availableContexts.empty()) {
-    Recycle();
+  ReadContext *context = nullptr;
+  if (!availableContexts.empty()) {
+    context = availableContexts.back();
+    availableContexts.pop_back();
+    // inflightContexts.emplace_back(context);
   }
-
-  ReadContext *context = availableContexts.back();
-  inflightContexts.emplace_back(context);
-  availableContexts.pop_back();
 
   return context;
 }
@@ -240,6 +239,25 @@ void ReadContextPool::Recycle() {
   }
 }
 
+void ReadContextPool::ReturnContext(ReadContext *readContext)
+{
+  bool isAvailable = true;
+  for (auto ctx : readContext->ioContext) {
+    if (!ctx->available) {
+      isAvailable = false;
+    }
+  }
+  if (!isAvailable) {
+    printf("ReadContext should be available!\n");
+  } else {
+    for (auto ctx : readContext->ioContext) {
+      requestPool->ReturnRequestContext(ctx);
+    }
+    readContext->ioContext.clear();
+  }
+  availableContexts.emplace_back(readContext);
+}
+
 bool ReadContextPool::checkReadAvailable(ReadContext *readContext)
 {
   bool isAvailable = true;
@@ -250,7 +268,7 @@ bool ReadContextPool::checkReadAvailable(ReadContext *readContext)
   }
   if (isAvailable) {
     for (auto ctx : readContext->ioContext) {
-      requestPool->returnRequestContext(ctx);
+      requestPool->ReturnRequestContext(ctx);
     }
     readContext->ioContext.clear();
   }
@@ -316,7 +334,7 @@ bool StripeWriteContextPool::checkStripeAvailable(StripeWriteContext *stripe) {
 
   if (isAvailable) {
     for (auto slot : stripe->ioContext) {
-      rPool->returnRequestContext(slot);
+      rPool->ReturnRequestContext(slot);
     }
     stripe->ioContext.clear();
   }

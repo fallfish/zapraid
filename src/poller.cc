@@ -8,12 +8,16 @@
 #include "raid_controller.h"
 #include <sys/time.h>
 
+void handleContext(RequestContext *context);
+
 void updatePba2(void *arg1, void *arg2)
 {
   RAIDController *ctrl = reinterpret_cast<RAIDController*>(arg1);
   RequestContext *ctx = reinterpret_cast<RequestContext*>(arg2);
-  for (uint32_t i = 0; i < ctx->size / Configuration::GetBlockSize(); ++i) {
-    uint64_t lba = ctx->lba + i * Configuration::GetBlockSize();
+  uint32_t blockSize = Configuration::GetBlockSize();
+  uint32_t numBlocks = ctx->size / Configuration::GetBlockSize();
+  for (uint32_t i = 0; i < numBlocks; ++i) {
+    uint64_t lba = ctx->lba + i * blockSize;
     ctrl->UpdateIndex(lba, ctx->pbaArray[i]);
   }
   ctx->status = WRITE_COMPLETE;
@@ -134,7 +138,7 @@ static void handleStripeUnitContext(RequestContext *context)
           parent->pbaArray[(context->lba - parent->lba) / Configuration::GetBlockSize()] = context->GetPba();
           parent->successBytes += context->targetBytes;
           if (contextReady(parent)) {
-            handleUserContext(parent);
+            handleContext(parent);
           }
           assert(parent->successBytes <= parent->targetBytes);
         }
@@ -159,12 +163,13 @@ static void handleStripeUnitContext(RequestContext *context)
         context->segment->ReadComplete(context);
         context->associatedRequest->successBytes += Configuration::GetBlockSize();
         if (contextReady(context->associatedRequest)) {
-          handleUserContext(context->associatedRequest);
+          handleContext(context->associatedRequest);
         }
         assert(context->associatedRequest->successBytes <= context->associatedRequest->targetBytes);
 
         status = READ_COMPLETE;
         context->available = true;
+        context->segment->ReclaimReadContext(context->associatedRead);
       }
       break;
     case DEGRADED_READ_SUB:
@@ -206,8 +211,6 @@ void handleContext(RequestContext *context)
     handleStripeUnitContext(context);
   } else if (type == GC) {
     handleGcContext(context);
-  } else if (type == INDEX) {
-    handleIndexContext(context);
   }
 }
 
@@ -529,7 +532,6 @@ void progressGcIndexUpdate2(void *arg1, void *arg2)
     lbas.emplace_back(it->first);
     pbas.emplace_back(it->second);
   }
-
   ctrl->GcBatchUpdateIndex(lbas, pbas);
   task->stage = INDEX_UPDATE_COMPLETE;
 }

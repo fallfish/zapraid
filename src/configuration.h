@@ -83,14 +83,6 @@ public:
     return GetInstance().gDeviceSupportMetadata;
   }
 
-  static int GetZoneCapacity() {
-    return GetInstance().gZoneCapacity;
-  }
-
-  static void SetZoneCapacity(int cap) {
-    GetInstance().gZoneCapacity = cap;
-  }
-
   static SystemMode GetSystemMode() {
     return GetInstance().gSystemMode;
   }
@@ -250,25 +242,25 @@ public:
 private:
   bool gIsBrandNew = true;
 
-  int gStripeSize = 4096 * 3;
-  int gStripeDataSize = 4096 * 2;
+  int gStripeSize = 4096 * 4;
+  int gStripeDataSize = 4096 * 3;
   int gStripeParitySize = 4096 * 1;
   int gStripeUnitSize = 4096 * 1;
   int gStripeBlockSize = 4096;
   int gBlockSize = 4096;
   int gMetadataSize = 64;
   int gNumIoThreads = 1;
-  bool gDeviceSupportMetadata = true;
+  bool gDeviceSupportMetadata = false;
   int gZoneCapacity = 0;
   int gStripePersistencyMode = 0;
   bool gEnableGc = true;
-  int gSyncGroupSize = 512;
+  int gSyncGroupSize = 256;
   bool gEnableDegradedRead = false;
   uint32_t gNumOpenSegments = 1;
   RAIDLevel gRaidScheme = RAID5;
   bool gEnableHeaderFooter = true;
 
-  uint64_t gStorageSpaceInBytes = 8 * 1024 * 1024 * 1024ull;
+  uint64_t gStorageSpaceInBytes = 10 * 1024 * 1024 * 1024ull;
 
   SystemMode gSystemMode = ZAPRAID;
 
