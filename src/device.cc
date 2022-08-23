@@ -141,7 +141,7 @@ void Device::InitZones(uint32_t numNeededZones, uint32_t numReservedZones)
   mZones = new Zone[mNumZones];
   for (int i = 0; i < mNumZones; ++i) {
     mZones[i].Init(this, i * mZoneSize, mZoneCapacity, mZoneSize);
-    mAvailableZones.emplace_back(&mZones[i]);
+    mAvailableZones.insert(&mZones[i]);
   }
 }
 
@@ -153,19 +153,27 @@ bool Device::HasAvailableZone()
 Zone* Device::OpenZone()
 {
   assert(!mAvailableZones.empty());
-  Zone* zone = mAvailableZones.back();
+  auto it = mAvailableZones.begin();
+  Zone* zone = *it;
+  mAvailableZones.erase(it);
 
-  mUsedZones[zone->GetSlba()] = zone;
-  mAvailableZones.pop_back();
+  return zone;
+}
+
+Zone* Device::OpenZoneBySlba(uint64_t slba)
+{
+  uint32_t zid = slba / mZoneSize;
+  Zone *zone = mZones[zid];
+
+  assert(mAvailableZones.find(zone) != mAvailableZones.end());
+  mAvailableZones.erase(zone);
 
   return zone;
 }
 
 void Device::ReturnZone(Zone* zone)
 {
-
-  mUsedZones.erase(zone->GetSlba());
-  mAvailableZones.emplace_back(zone);
+  mAvailableZones.insert(zone);
 }
 
 void Device::issueIo2(spdk_event_fn event_fn, RequestContext *slot)
@@ -310,64 +318,50 @@ uint32_t Device::GetNumZones()
   return mNumZones;
 }
 
-std::map<uint64_t, std::pair<uint32_t, uint8_t*>> Device::ReadZoneHeaders()
+void Device::ReadZoneHeaders(std::map<uint64_t, uint8_t*> &zones)
 {
-//  bool done = false;
-//  auto complete = [](void *arg, const struct spdk_nvme_cpl *completion) {
-//    bool *done = (bool*)arg;
-//    *done = true;
-//  }
-//
-//  std::map<uint64_t, <uint32_t, uint8_t*>> zones;
-//
-//  // Read zone report
-//  struct spdk_nvme_zns_zone_report *report;
-//  uint32_t report_bytes = sizeof(report->descs[0]) * mNumZones + sizeof(*report);
-//  report = (struct spdk_nvme_zns_zone_report *)calloc(1, report_bytes);
-//  spdk_nvme_zns_report_zones(mNamespace, mIoQueues[0], &states, 4096, 0,
-//                             SPDK_NVME_ZRA_LIST_ALL, false, complete, &done);
-//  while (!done) ;
-//
-//  for (uint32_t i = 0; i < report->nr_zones; ++i) {
-//    struct spdk_nvme_zns_desc *zdesc = &report->descs[i];
-//    uint32_t wp = ~0u;
-//    zslbaAndWp.first = zdesc->zslba;
-//
-//    if (zdesc->zs == SPDK_NVME_ZONE_STATE_FULL) {
-//      // This zone belongs to a sealed segment
-//      wp = ~0ull;
-//    } else if (zdesc->zs == SPDK_NVME_ZONE_STATE_IOPEN 
-//               || zdesc->zs == ZONE_STATE_EOPEN) {
-//      wp = zdesc->wp;
-//    } else {
-//      continue;
-//    }
-//    uint8_t *buffer = spdk_zmalloc(Configuration::GetBlockSize(), 4096,
-//                                   NULL, SPDK_ENV_SOCKET_ID_ANY,
-//                                   SPDK_MALLOC_DMA);
-//    zones[zdesc->zslba] = std::make_pair(wp, buffer);
-//  }
-//
-//  // Read zone headers
-//  for (auto z : sealedZones) {
-//    done = false;
-//    uint64_t zslba = z.first;
-//    uint32_t *buffer = z.second;
-//    spdk_nvme_ns_cmd_read(mNamespace, mIoQueues[0],
-//                          buffer, zslba, 1,
-//                          complete, &done, 0);
-//    while (!done);
-//  }
-//
-//  for (auto z : openZones) {
-//    done = false;
-//    uint64_t zslba = z.first.first;
-//    uint32_t *buffer = z.second;
-//    spdk_nvme_ns_cmd_read(mNamespace, mIoQueues[0],
-//                          buffer, zslba, 1,
-//                          complete, &done, 0);
-//    while (!done);
-//  }
+  bool done = false;
+  auto complete = [](void *arg, const struct spdk_nvme_cpl *completion) {
+    bool *done = (bool*)arg;
+    *done = true;
+  }
 
-//  return zones;
+  // Read zone report
+  struct spdk_nvme_zns_zone_report *report;
+  uint32_t report_bytes = sizeof(report->descs[0]) * mNumZones + sizeof(*report);
+  report = (struct spdk_nvme_zns_zone_report *)calloc(1, report_bytes);
+  spdk_nvme_zns_report_zones(mNamespace, mIoQueues[0], &states, 4096, 0,
+                             SPDK_NVME_ZRA_LIST_ALL, false, complete, &done);
+  while (!done) ;
+
+  for (uint32_t i = 0; i < report->nr_zones; ++i) {
+    struct spdk_nvme_zns_desc *zdesc = &report->descs[i];
+    uint64_t wp = ~0ull;
+    uint64_t zslba = zdesc->zslba;
+
+    if (zdesc->zs == SPDK_NVME_ZONE_STATE_FULL
+        || zdesc->zs == SPDK_NVME_ZONE_STATE_IOPEN 
+        || zdesc->zs == ZONE_STATE_EOPEN) {
+      if (zdesc->wp != zslba) {
+        wp = zdesc->wp;
+      }
+    }
+    
+    if (wp == ~0ull) {
+      continue;
+    }
+
+    uint8_t *buffer = spdk_zmalloc(Configuration::GetBlockSize(), 4096,
+                                   NULL, SPDK_ENV_SOCKET_ID_ANY,
+                                   SPDK_MALLOC_DMA);
+    done = false;
+    spdk_nvme_ns_cmd_read(mNamespace, mIoQueues[0], buffer, zslba, 1, complete, &done, 0);
+    while (!done) {
+      spdk_nvme_qpair_process_completions(mIoQueues[0], 0);
+    }
+
+    zones[wp] = buffer;
+  }
+
+  return zones;
 }

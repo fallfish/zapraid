@@ -44,3 +44,227 @@ void RAIDController::doRead(RequestContext *ctx)
     }
   }
 }
+
+void Segment::ReadStripeMeta(RequestContext *ctx)
+{
+  uint32_t zoneId = ctx->zoneId;
+  uint32_t offset = ctx->offset;
+  int n = Configuration::GetStripeSize() / Configuration::GetStripeUnitSize();
+  int k = Configuration::GetStripeDataSize() / Configuration::GetStripeUnitSize();
+  bool isSingleBlock = (sizeof(uint16_t) * Configuration::GetSyncGroupSize() * n <= 4096);
+
+  ReadContext *readContext = ctx->associatedRead;
+
+  // Note that data region begins from offset 1, we need to decrement the offset by 1
+  uint32_t offsetOfLastStripeInRequestedGroup = 
+      ((offset - 1) | (Configuration::GetSyncGroupSize() - 1)) + 1;
+  uint32_t offsetOfLastStripeInCurrentGroup =
+      (mPos | (Configuration::GetSyncGroupSize() - 1)) + 1;
+  ctx->successBytes = 0;
+
+  if (offsetOfLastStripeInCurrentGroup == offsetOfLastStripeInRequestedGroup) {
+    ctx->needDecodeMeta = false;
+    ctx->targetBytes = n * Configuration::GetBlockSize();
+
+    for (uint32_t i = 0; i < n; ++i) {
+      RequestContext *reqCtx = mRequestContextPool->GetRequestContext(true);
+      reqCtx->Clear();
+      reqCtx->associatedRequest = ctx;
+      reqCtx->status = DEGRADED_READ_SUB;
+      reqCtx->type = STRIPE_UNIT;
+      reqCtx->targetBytes = Configuration::GetBlockSize();
+      reqCtx->ctrl = mRaidController;
+      reqCtx->segment = this;
+      reqCtx->zoneId = 0;
+      reqCtx->offset = offsetOfLastStripeInRequestedGroup;
+      reqCtx->data = reqCtx->dataBuffer;
+      reqCtx->meta = reqCtx->metadataBuffer;
+
+      readContext->data[i] = reqCtx->data;
+      readContext->ioContext.emplace_back(reqCtx);
+
+      memcpy(reqCtx->data, mCurrentNamedGroupMetadata.data, Configuration::GetBlockSize());
+      reqCtx->successBytes = reqCtx->targetBytes;
+      reqCtx->Queue();
+    }
+  } else {
+    ctx->needDecodeMeta = true;
+    if (isSingleBlock) {
+      ctx->targetBytes = Configuration::GetBlockSize();
+    } else {
+      ctx->targetBytes = k * Configuration::GetBlockSize();
+    }
+    uint32_t cnt = 0;
+    for (int i = 0; i < n && cnt < k; ++i) {
+      if (i == zoneId) continue;
+      RequestContext *reqCtx = mRequestContextPool->GetRequestContext(true);
+      reqCtx->Clear();
+      reqCtx->associatedRequest = ctx;
+      reqCtx->status = DEGRADED_READ_SUB;
+      reqCtx->type = STRIPE_UNIT;
+      reqCtx->targetBytes = Configuration::GetBlockSize();
+      reqCtx->ctrl = mRaidController;
+      reqCtx->segment = this;
+      reqCtx->zoneId = i;
+      reqCtx->offset = offsetOfLastStripeInRequestedGroup;
+      reqCtx->data = reqCtx->dataBuffer;
+      reqCtx->meta = reqCtx->metadataBuffer;
+
+      readContext->data[i] = reqCtx->data;
+      readContext->ioContext.emplace_back(reqCtx);
+
+      if ((!isSingleBlock) || (isSingleBlock && cnt == 0)) {
+        mZones[i]->Read(reqCtx->offset, Configuration::GetBlockSize(), reqCtx);
+      }
+
+      cnt++;
+    }
+  }
+}
+
+void Segment::ReadStripe(RequestContext *ctx)
+{
+  SystemMode mode = Configuration::GetSystemMode();
+
+  uint32_t zoneId = ctx->zoneId;
+  uint32_t offset = ctx->offset;
+  uint32_t n = Configuration::GetStripeSize() / Configuration::GetStripeUnitSize();
+  uint32_t k = Configuration::GetStripeDataSize() / Configuration::GetStripeUnitSize();
+  ReadContext *readContext = ctx->associatedRead;
+
+  if (mode == ZONE_WRITE || mode == ZAPRAID) {
+    uint32_t realOffsets[n];
+    ctx->targetBytes = k * Configuration::GetStripeUnitSize();
+    ctx->successBytes = 0;
+    if (mode == ZONE_WRITE) { // PURE_WRITE
+      for (uint32_t i = 0; i < n; ++i) {
+        realOffsets[i] = offset;
+      }
+    } else if (mode == ZAPRAID) {
+      // decode metadata
+      uint16_t offsetMap[Configuration::GetStripeSize() / 2];
+
+      bool isSingleBlock = (sizeof(uint16_t) * Configuration::GetSyncGroupSize() * n <= 4096);
+      if (isSingleBlock) {
+        if (ctx->needDecodeMeta && zoneId == 0) {
+          memcpy((uint8_t *)offsetMap, readContext->data[1], Configuration::GetBlockSize());
+        } else {
+          memcpy((uint8_t *)offsetMap, readContext->data[0], Configuration::GetBlockSize());
+        }
+      } else {
+        // metadata stripe
+        if (ctx->needDecodeMeta) {
+          bool alive[n];
+          for (uint32_t i = 0; i < n; ++i) {
+            alive[i] = false;
+          }
+          for (uint32_t i = 1; i < 1 + k; ++i) {
+            uint32_t zid = readContext->ioContext[i]->zoneId;
+            alive[zid] = true;
+          }
+          readContext->data[zoneId] = ctx->data;
+          // The encoding position of METADATA is the same as its stripe ID due to Zone Write
+          decodeStripe(offset, readContext->data, alive, n, k, zoneId);
+          uint32_t metaOffset = offset | (Configuration::GetSyncGroupSize() - 1);
+          for (uint32_t i = 0; i < n; ++i) {
+            uint32_t zid = Configuration::CalculateDiskId(
+                metaOffset, i, (RAIDLevel)mSegmentMeta.raidScheme, mSegmentMeta.n);
+            memcpy((uint8_t*)offsetMap + i * Configuration::GetBlockSize(),
+                readContext->data[zid], Configuration::GetBlockSize());
+          }
+        } else {
+          for (uint32_t i = 0; i < n; ++i) {
+            memcpy((uint8_t*)offsetMap + i * Configuration::GetBlockSize(),
+                readContext->data[i], Configuration::GetBlockSize());
+          }
+        }
+      }
+      // offset to stripe ID
+      uint32_t stripeId = (offsetMap + zoneId * Configuration::GetSyncGroupSize())[offset % Configuration::GetSyncGroupSize()];
+      uint32_t offsetBegin = offset & (~(Configuration::GetSyncGroupSize() - 1));
+
+      for (uint32_t i = 0; i < n; ++i) {
+        uint16_t *offsetMapCurZone = offsetMap + i * Configuration::GetSyncGroupSize();
+        for (uint32_t j = 0; j < Configuration::GetSyncGroupSize() - 1; ++j) {
+          if (offsetMapCurZone[j] == stripeId) {
+            realOffsets[i] = offsetBegin + j;
+          }
+        }
+      }
+    }
+
+    uint32_t cnt = 0;
+    for (uint32_t i = 0; i < n && cnt < k; ++i) {
+      if (i == zoneId) continue;
+      RequestContext *reqCtx = nullptr;
+      if (Configuration::GetSystemMode() == ZONE_WRITE) {
+        reqCtx = mRequestContextPool->GetRequestContext(true);
+        readContext->ioContext.emplace_back(reqCtx);
+      } else {
+        reqCtx = readContext->ioContext[1 + cnt];
+      }
+      reqCtx->Clear();
+      reqCtx->associatedRequest = ctx;
+      reqCtx->status = DEGRADED_READ_SUB;
+      reqCtx->type = STRIPE_UNIT;
+      reqCtx->targetBytes = Configuration::GetStripeUnitSize();
+      reqCtx->ctrl = mRaidController;
+      reqCtx->segment = this;
+      reqCtx->zoneId = i;
+      reqCtx->offset = realOffsets[i];
+      reqCtx->data = reqCtx->dataBuffer;
+      reqCtx->meta = reqCtx->metadataBuffer;
+
+      readContext->data[i] = reqCtx->data;
+
+      mZones[i]->Read(realOffsets[i], Configuration::GetStripeUnitSize(), reqCtx);
+
+      ++cnt;
+    }
+  } else if (mode == GROUP_LAYOUT) {
+    // Note that the sync group size must be small
+    ctx->targetBytes = k * Configuration::GetStripeUnitSize() * Configuration::GetSyncGroupSize();
+    ctx->successBytes = 0;
+    uint32_t offsetBegin = offset & (~(Configuration::GetSyncGroupSize() - 1));
+    uint32_t offsetEnd = offsetBegin + Configuration::GetSyncGroupSize();
+
+    for (uint32_t i = 0; i < n; ++i) {
+      if (i == zoneId) continue;
+      for (uint32_t offset = offsetBegin; offset < offsetEnd; ++offset) {
+        RequestContext *reqCtx = mRequestContextPool->GetRequestContext(true);
+        reqCtx->Clear();
+        reqCtx->associatedRequest = ctx;
+        reqCtx->status = DEGRADED_READ_SUB;
+        reqCtx->type = STRIPE_UNIT;
+        reqCtx->targetBytes = Configuration::GetStripeUnitSize();
+        reqCtx->ctrl = mRaidController;
+        reqCtx->segment = this;
+        reqCtx->zoneId = i;
+        reqCtx->offset = offset;
+        reqCtx->data = reqCtx->dataBuffer;
+        reqCtx->meta = reqCtx->metadataBuffer;
+
+        readContext->ioContext.emplace_back(reqCtx);
+        mZones[i]->Read(offset, Configuration::GetStripeUnitSize(), reqCtx);
+      }
+    }
+  }
+
+  if (mode == ZONE_APPEND) {
+    fprintf(stderr, "Pure zone append does not support recovery.\n");
+    exit(-1);
+  }
+}
+
+//    if (Configuration::GetSystemMode() == GROUP_LAYOUT) {
+//      for (uint32_t i = 1; i < readContext->ioContext.size(); ++i) {
+//        RequestContext *reqCtx = readContext->ioContext[i];
+//        BlockMetadata *metadata = (BlockMetadata*)reqCtx->meta;
+//        if (metadata->fields.nonProtectedField.stripeId == ctx->stripeId) {
+//          alive[reqCtx->zoneId] = true;
+//          readContext->data[reqCtx->zoneId] = reqCtx->data;
+//        }
+//      }
+//    } else {
+//    }
+

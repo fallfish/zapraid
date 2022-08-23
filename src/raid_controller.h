@@ -170,8 +170,6 @@ private:
   std::queue<RequestContext*> mRequestQueue;
   std::mutex mRequestQueueMutex;
 
-  std::mutex mIndexLock;
-
   struct GcTask mGcTask;
 
   uint32_t mNumOpenSegments = 1;

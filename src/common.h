@@ -46,7 +46,6 @@ struct Request {
 struct PhysicalAddr {
   Segment* segment;
   uint32_t zoneId;
-  uint32_t stripeId;
   uint32_t offset;
   void PrintOffset();
 

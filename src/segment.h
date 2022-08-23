@@ -150,6 +150,11 @@ public:
   void GenerateParityBlock(StripeWriteContext *stripe, uint32_t zonePos);
   void ProgressFooterWriter();
 
+  // For recovery
+  void SetSegmentStatus(SegmentStatus status);
+  void RecoverIndexUsingFooter(std::map<uint64_t, std::pair<uint64_t, PhysicalAddr>> &indexMap);
+  void RecoverIndexUsingBlocks(std::map<uint64_t, std::pair<uint64_t, PhysicalAddr>> &indexMap, std::vector<std::pair<uint64_t, uint8_t*>> zonesWp)
+
 private:
   RequestContextPool *mRequestContextPool;
 

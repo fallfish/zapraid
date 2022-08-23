@@ -215,19 +215,130 @@ void RAIDController::Init(bool need_env)
   } else {
     // Mount from an existing new array
     // Reconstruct existing segments
-//    std::map<uint64_t, std::pair<uint32_t, uint8_t*>> zonesAndHeaders;
-//    for (uint32_t i = 0; i < mDevices.size(); ++i) {
-//      auto zonesAndHeadersDevice = mDevices[i]->ReadZoneHeaders();
-//      zonesAndHeaders.insert(zonesAndHeadersDevice.begin(), zonesAndHeadersDevice.end());
-//    }
-//
-//    std::map<uint32_t, std::vector<uint32_t, SegmentMetadata*>> potentialSegments; // Segment ID to SegmentMetadata
-//    for (auto zoneAndHeader : zonesAndHeaders) {
-//      uint64_t zslba = zoneAndHeader.first;
-//      uint32_t wp = zoneAndHeader.second.first;
-//      SegmentMetadata *segMeta = (SegmentMetadata*)zoneAndHeader.second.second;
-//      potentialSegments[segMeta->segmentId].emplace_back(std::pair(segMeta));
-//    }
+
+    uint32_t zoneSize = 2 * 1024 * 1024 / 4;
+    // Valid (full and open) zones and their headers
+    std::map<uint64_t, uint8_t*> zonesAndHeaders[mDevice.size()];
+    // Segment ID to SegmentMetadata
+    std::map<uint32_t, std::vector<std::pair<uint64_t, SegmentMetadata*>>> potentialSegments; 
+
+    for (uint32_t i = 0; i < mDevices.size(); ++i) {
+      mDevices[i]->ReadZoneHeaders(zonesAndHeaders[i]);
+      for (auto zoneAndHeader : zonesAndHeaders[i]) {
+        uint64_t zslba = zoneAndHeader.first;
+        uint32_t wp = zoneAndHeader.second.first;
+        SegmentMetadata *segMeta = (SegmentMetadata*)zoneAndHeader.second.second;
+        potentialSegments[segMeta->segmentId].emplace_back(std::pair(wp, segMeta));
+      }
+    }
+
+    // Filter out invalid segments
+    for (auto it = potentialSegments->begin();
+         it != potentialSegments->end(); ) {
+      auto &zones = it->second;
+      bool isValid = true;
+      if (zones.size() != mDevices.size()) {
+        // not a valid segment; because not enough zones given
+        isValid = false;
+      }
+
+      if (isValid) {
+        SegmentMetadata *segMeta = nullptr;
+        for (auto zone : zones) {
+          if (segMeta == nullptr) {
+            segMeta = zone.second;
+          }
+
+          if (memcmp(segMeta, zoneSegMeta, sizeof(SegmentMeta)) != 0) {
+            // TODO: Handle corrupted segment metadata
+            isValid = false;
+            break;
+          }
+        }
+
+        printf("segment ID: %llu, n: %u, k: %u, numZones: %u\n",
+            segMeta->segmentId, segMeta->n, segMeta->k, segMeta->numZones);
+      }
+
+      if (!isValid) {
+        for (zone : zones) {
+          spdk_free(zone.second); // free the allocated metadata memory
+        }
+        it = potentialSegments->erase(it);
+      } else {
+        ++it;
+      }
+    }
+
+    std::map<uint64_t, std::pair<uint64_t, PhysicalAddr>> indexMap;
+    // reconstruct all open, sealed segments (Segment Table)
+    for (auto it = potentialSegments->begin();
+         it != potentialSegments->end(); ) {
+      uint32_t segmentId = it->first;
+      auto &zones = it->second;
+      RequestContextPool *rqPool = mRequestContextPoolForSegments;
+      ReadContextPool *rdPool = mReadContextPool;
+      StripeWriteContext *wPool = nullptr;
+
+      mNextAssignedSegmentId = std::max(segmentId + 1, mNextAssignedSegmentId);
+
+      // Check the segment is sealed or not
+      bool sealed = true;
+      uint64_t segWp = zoneSize;
+      SegmentMetadata *segMeta = nullptr;
+      for (auto zone : zones) {
+        segWp = std::min(segWp, zone.first % zoneSize);
+        segMeta = zone.second;
+      }
+      if (segWp == zoneCapacity) {
+        // sealed
+        Segment *seg = new Segment(this, segmentId, rqPool, rdPool, wPool);
+        for (uint32_t i = 0; i < segMeta->numZones; ++i) {
+          Zone *zone = mDevices[i]->OpenZoneBySlba(segMeta->zones[i]);
+          seg->AddZone(zone);
+        }
+        seg->SetStatus(SEGMENT_SEALED);
+        mSealedSegments.insert(seg);
+
+        // Read the footer region for recovering L2P table
+        seg->RecoverIndexUsingFooter(indexMap);
+      } else {
+        wPool = mStripeWriteContextPools[0];
+        // open
+        Segment *seg = new Segment(this, segmentId, rqPool, rdPool, wPool);
+        for (uint32_t i = 0; i < segMeta->numZones; ++i) {
+          Zone *zone = mDevices[i]->OpenZoneBySlba(segMeta->zones[i]);
+          seg->AddZone(zone);
+        }
+        segments[0] = seg;
+        seg->SetStatus(SEGMENT_NORMAL);
+
+        seg->RecoverIndexMapUsingBlocks(indexMap, zones);
+      }
+
+      for (auto pr : indexMap) {
+        PhysicalAddr pba = pr.second.second;
+        mAddressMap[pr.first] = mAddressMap[pr.second.second];
+        pba.segment->FinishBlock(pba.zoneId, pba.offset, pba.lba);
+      }
+
+      for (Segment *segment : mSealedSegments) {
+        segment->FinishRecovery();
+      }
+
+      for (Segment *segment : mSegmentsToSeal) {
+        segment->FinishRecovery();
+      }
+
+      for (Segment *segment : mOpenSegments) {
+        segment->FinishRecovery();
+      }
+
+      if (mOpenSegments.size() >= 1) {
+        printf("We should not have multiple open segments.\n");
+      }
+    }
+
   }
 
   if (Configuration::GetEventFrameworkEnabled()) {

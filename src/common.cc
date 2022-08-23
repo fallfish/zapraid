@@ -66,7 +66,6 @@ PhysicalAddr RequestContext::GetPba()
   PhysicalAddr addr;
   addr.segment = segment;
   addr.zoneId = zoneId;
-  addr.stripeId = stripeId;
   addr.offset = offset;
   return addr;
 }

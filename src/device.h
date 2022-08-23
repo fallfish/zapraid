@@ -5,8 +5,8 @@
 #include "spdk/nvme_zns.h"
 #include "common.h"
 #include <unordered_map>
-#include <deque>
 #include <vector>
+#include <set>
 
 class Zone;
 class Device {
@@ -26,6 +26,7 @@ public:
   void FinishZone(Zone *zone, void *ctx); // seal
   bool HasAvailableZone();
   Zone* OpenZone();
+  Zone* OpenZoneBySlba(uint64_t slba);
   void  ReturnZone(Zone*);
 
   void AddAvailableZone(Zone *zone);
@@ -36,11 +37,12 @@ public:
   struct spdk_nvme_ctrlr* GetController() { return mController; }
   struct spdk_nvme_ns* GetNamespace() { return mNamespace; }
   struct spdk_nvme_qpair** GetIoQueues() { return mIoQueues; }
+  struct spdk_nvme_qpair* GetIoQueues(uint32_t id) { return mIoQueues[id]; }
 
   uint64_t GetZoneCapacity();
   uint32_t GetNumZones();
 
-  std::map<uint64_t, std::pair<uint32_t, uint8_t*>> ReadZoneHeaders();
+  ReadZoneHeaders(std::map<uint64_t, std::pair<uint32_t, uint8_t*>> &zones);
 
 private:
   void issueIo2(spdk_event_fn event_fn, RequestContext *slot);
@@ -59,8 +61,7 @@ private:
 
   uint32_t mDeviceId;
 
-  std::unordered_map<int, Zone*> mUsedZones;
-  std::vector<Zone*> mAvailableZones;
+  std::set<Zone*> mAvailableZones;
   Zone* mZones;
 };
 

@@ -199,7 +199,6 @@ public:
   }
 
   static uint32_t CalculateDiskId(uint32_t stripeId, uint32_t whichBlock, RAIDLevel raidScheme, uint32_t numDisks) {
-    Configuration& conf = GetInstance();
     // calculate which disk current block (data/parity) should go
     uint32_t driveId = ~0u;
     uint32_t idOfGroup = stripeId % numDisks;
