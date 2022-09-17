@@ -1,0 +1,717 @@
+---
+name: verify
+
+on:
+  push:
+    branches:
+    - '*'
+    tags:
+    - '*'
+  pull_request:
+    types: [labeled, opened, reopened, synchronize]
+    branches:
+    - '*'
+  workflow_dispatch:
+    inputs:
+      job:
+        description: 'Job'
+        required: true
+        default: all
+        type: choice
+        options:
+        - all
+        - analyze
+        - analyze-codeql
+        - analyze-coverity
+        - build
+        - build-linux
+        - build-windows
+        - build-macos
+        - build-and-test
+        - docgen
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  #
+  # Produce a "full" source-archive, that is, xNVMe and source from subprojects
+  #
+  # This is done for multiple reasons:
+  #
+  # * To provide a CI-artifact consisting of xNVMe and dependent projects for software-packagers
+  # to consume, as well as users in environments with no network access, a one-stop shop
+  #
+  # * For use in the xNVMe CI pipeline, the source-archive provided to others is tested and used by
+  # the xNVMe CI pipeline itself, thus users will know that the archive should be and run on the
+  # systems tested in the GitHUB CI workflow
+  #
+  source-archive:
+    runs-on: ubuntu-20.04
+    container: refenv/alpine-bash
+    if: ((github.event.action != 'labeled') || (github.event.action == 'labeled') && (github.event.label.name == 'pr-ready-for-test'))
+
+    steps:
+    - name: Grab source
+      uses: actions/checkout@v3.0.1
+    - name: Add repos to git-config safe.directory
+      run: |
+        git config --global --add safe.directory $(pwd)
+
+    - name: Check repository...
+      run: |
+        ls -lha
+        git status
+
+    - name: Generate Full Source Archive
+      run: |
+        ./toolbox/pkgs/alpine-latest.sh
+        make clean gen-src-archive
+
+    - name: Upload source archive
+      uses: actions/upload-artifact@v2
+      with:
+        name: archive-src
+        path: builddir/meson-dist/*.tar.gz
+
+  #
+  # Check source-format using pre-commit
+  #
+  source-format-check:
+    runs-on: ubuntu-latest
+    container: refenv/xnvme-devtools-ci:latest
+
+    steps:
+    - name: Grab source
+      uses: actions/checkout@v3.0.1
+    - name: Add repos to git-config safe.directory
+      run: |
+        git config --global --add safe.directory $(pwd)
+
+    - name: Run pre-commit
+      run: pre-commit run --all-files
+
+  #
+  # Code-analysis using GitHUB CodeQL
+  #
+  analyze-codeql:
+    needs: source-archive
+    runs-on: ubuntu-latest
+    if: ((github.event_name == 'workflow_dispatch') && ((github.event.inputs.job == 'all') || contains('analyze-codeql', github.event.inputs.job)))
+
+    container: debian:bullseye
+
+    steps:
+    - name: Retrieve the source-archive
+      uses: actions/download-artifact@v2
+      with:
+        name: archive-src
+    - name: Extract the full-source-archive
+      run: |
+        tar xzf xnvme*.tar.gz --strip 1
+        rm xnvme*.tar.gz
+
+    - name: Install build-requirements
+      run: source toolbox/pkgs/debian-bullseye.sh
+
+    - name: Configure, the build
+      run: make config
+
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v1
+      with:
+        languages: 'cpp'
+        config-file: ./.github/codeql/codeql-config.yml
+
+    - name: Build
+      run: make -j $(nproc)
+
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v1
+
+  #
+  # Code-analysis using Coverity
+  #
+  analyze-coverity:
+    needs: source-archive
+    runs-on: ubuntu-latest
+    if: ((github.event_name == 'workflow_dispatch') && ((github.event.inputs.job == 'all') || contains('analyze-coverity',
+      github.event.inputs.job)))
+
+    container: debian:buster
+    env:
+      COVERITY_TGZ_PATH: "/tmp/cov-analysis-linux64.tar.gz"
+      COVERITY_ROOT: "/tmp/cov-analysis-linux64"
+      PROJECT_NAME: "xNVMe"
+
+    steps:
+    - name: Retrieve the source-archive
+      uses: actions/download-artifact@v2
+      with:
+        name: archive-src
+    - name: Extract the full-source-archive
+      run: |
+        tar xzf xnvme*.tar.gz --strip 1
+        rm xnvme*.tar.gz
+
+    - name: xNVMe, install build-requirements
+      run: |
+        source toolbox/pkgs/debian-buster.sh
+
+    - name: xNVMe, configure the build
+      run: |
+        make config
+
+    - name: xNVMe, dump the compile-commands and machine
+      run: |
+        cat /proc/cpuinfo || true
+        cat build/compile_commands.json || true
+
+    - name: Project, define version env. var.
+      run: |
+        PROJECT_VERSION=$(python3 toolbox/xnvme_ver.py --path meson.build)
+        echo "PROJECT_VERSION=${PROJECT_VERSION}" >> $GITHUB_ENV
+
+    - name: Coverity, install requirements
+      run: |
+        apt-get install -qy wget curl
+
+    - name: Coverity, download
+      run: |
+        wget -q https://scan.coverity.com/download/cxx/linux64 \
+         --post-data "token=${{ secrets.COVERITY_SCAN_TOKEN }}&project=${PROJECT_NAME}" \
+         -O ${COVERITY_TGZ_PATH}
+
+    - name: Coverity, unpack
+      run: |
+        mkdir -p "${COVERITY_ROOT}"
+        tar xzf "${COVERITY_TGZ_PATH}" --strip 1 -C "${COVERITY_ROOT}"
+
+    - name: Coverity, configure compiler/gcc
+      run: |
+        export PATH="${COVERITY_ROOT}/bin:$PATH"
+        cov-configure --gcc
+
+    - name: Coverity, build xNVMe
+      run: |
+        export PATH="${COVERITY_ROOT}/bin:$PATH"
+        make clean config
+        cov-build --dir cov-int make
+
+    - name: Coverity, submit results for analysis
+      run: |
+        tar czvf "${PROJECT_NAME}_cov.tgz" cov-int
+        curl --form token=${{ secrets.COVERITY_SCAN_TOKEN }} \
+        --form email=${{ secrets.COVERITY_SCAN_EMAIL }} \
+        --form file=@${PROJECT_NAME}_cov.tgz \
+        --form version="v${PROJECT_VERSION}" \
+        --form description="xNVMe libraries and tools for NVMe" \
+        "https://scan.coverity.com/builds?project=${PROJECT_NAME}"
+
+  #
+  # dockerize the xNVMe source archive, that is, produce a docker-image which is:
+  #
+  # * Based on 'refenv/qemu-nvme' (from DockerHub)
+  # * Contains the content of the xNVMe source-archive
+  # * Published on DockerHub
+  #
+  dockerize-source:
+    needs: source-archive
+    runs-on: ubuntu-latest
+    if: ((github.event_name == 'workflow_dispatch') && ((github.event.inputs.job == 'all') || (github.event.inputs.job ==
+      'dockerize-source')))
+
+    steps:
+    - name: Retrieve the source-archive
+      uses: actions/download-artifact@v2
+      with:
+        name: archive-src
+
+    - name: Create a docker context
+      run: |
+        mkdir -p /tmp/dockerize/xnvme
+        tar xzf xnvme*.tar.gz --strip 1 -C /tmp/dockerize/xnvme
+        tar xzf xnvme*.tar.gz --strip 1
+        rm xnvme*.tar.gz
+
+    - name: Log into docker registry
+      run: echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+
+    - name: Dockerize bin
+      run: |
+        TAG=${GITHUB_SHA::8}
+        docker build \
+          -t refenv/xnvme:latest \
+          -t refenv/xnvme:${TAG} \
+          -f toolbox/Dockerfile /tmp/dockerize
+
+    - name: Push Docker image
+      run: docker push refenv/xnvme
+
+  #
+  # Build on Linux using different Linux distributions
+  #
+  build-linux:
+    needs: [source-archive, source-format-check]
+    runs-on: ubuntu-latest
+    if: ((github.event_name == 'pull_request') || ((github.event_name == 'workflow_dispatch') && ((github.event.inputs.job
+      == 'all') || contains('build-linux', github.event.inputs.job))))
+
+    strategy:
+      matrix:
+        container:
+        # Using an alpine container which is the same as upstream but with bash
+        # alpine: SPDK not supported, --with-spdk=false
+        # centos7: liburing 2.1 not supported, --with-liburing=false
+        # debian-stretch: liburing 2.1 not supported, --with-liburing=false
+        - {os: 'alpine', dh: 'refenv/alpine-bash', ver: 'latest'}
+        - {os: 'archlinux', dh: 'archlinux', ver: 'latest'}
+        - {os: 'centos', dh: 'tgagor/centos', ver: 'stream9'}
+        - {os: 'centos', dh: 'tgagor/centos', ver: 'stream8'}
+        - {os: 'centos', dh: 'centos', ver: 'centos7'}
+        - {os: 'debian', dh: 'debian', ver: 'bookworm'}
+        - {os: 'debian', dh: 'debian', ver: 'bullseye'}
+        - {os: 'debian', dh: 'debian', ver: 'buster'}
+        - {os: 'debian', dh: 'debian', ver: 'stretch'}
+        - {os: 'fedora', dh: 'fedora', ver: '36'}
+        - {os: 'fedora', dh: 'fedora', ver: '35'}
+        - {os: 'fedora', dh: 'fedora', ver: '34'}
+        - {os: 'gentoo', dh: 'gentoo/stage3', ver: 'latest'}
+        - {os: 'opensuse-tumbleweed', dh: 'opensuse/tumbleweed', ver: 'latest'}
+        - {os: 'opensuse-leap', dh: 'opensuse/leap', ver: '15.4'}
+        - {os: 'opensuse-leap', dh: 'opensuse/leap', ver: '15.3'}
+        - {os: 'ubuntu', dh: 'ubuntu', ver: 'impish'}
+        - {os: 'ubuntu', dh: 'ubuntu', ver: 'focal'}
+        - {os: 'ubuntu', dh: 'ubuntu', ver: 'bionic'}
+
+    container:
+      image: ${{ matrix.container.dh }}:${{ matrix.container.ver }}
+
+    steps:
+    - name: Container-preparation, openSUSE does not have tar and gzip...
+      if: contains(matrix.container.os, 'opensuse')
+      run: zypper --non-interactive install -y tar gzip
+
+    - name: Retrieve the source-archive
+      uses: actions/download-artifact@v2
+      with:
+        name: archive-src
+    - name: Extract the full-source-archive
+      run: |
+        tar xzf xnvme*.tar.gz --strip 1
+        rm xnvme*.tar.gz
+
+    - name: Install build-requirements
+      run: |
+        source toolbox/pkgs/${{ matrix.container.os }}-${{ matrix.container.ver }}.sh || true
+
+    - name: Configure, Build, and Install
+      env:
+        BSCRIPT_DEF: toolbox/pkgs/default-build.sh
+        BSCRIPT: toolbox/pkgs/${{ matrix.container.os }}-${{ matrix.container.ver }}-build.sh
+      run: |
+        if [[ -f "${BSCRIPT}" ]]; then source ${BSCRIPT}; else source ${BSCRIPT_DEF}; fi
+
+    - name: meson-log-dump
+      run: |
+        cat builddir/meson-logs/meson-log.txt
+
+    - name: Execute 'xnvme enum'
+      run: xnvme enum
+
+    - name: Execute 'xnvme library-info'
+      run: xnvme library-info
+
+  #
+  # Build on macOS
+  #
+  build-macos:
+    needs: [source-archive, source-format-check]
+    runs-on: ${{ matrix.runner.os }}-${{ matrix.runner.ver }}
+    if: ((github.event_name == 'pull_request') || ((github.event_name == 'workflow_dispatch') && ((github.event.inputs.job
+      == 'all') || contains('build-macos', github.event.inputs.job))))
+
+    strategy:
+      matrix:
+        runner:
+        - {os: 'macos', ver: '11'}
+
+    steps:
+    - name: Retrieve the source-archive
+      uses: actions/download-artifact@v2
+      with:
+        name: archive-src
+    - name: Extract the full-source-archive
+      run: |
+        tar xzf xnvme*.tar.gz --strip 1
+        rm xnvme*.tar.gz
+
+    - name: Install build-requirements
+      run: |
+        source toolbox/pkgs/${{ matrix.runner.os }}-${{ matrix.runner.ver }}.sh || true
+
+    - name: Configure, Build, and Install
+      env:
+        BSCRIPT_DEF: toolbox/pkgs/default-build.sh
+        BSCRIPT: toolbox/pkgs/${{ matrix.runner.os }}-${{ matrix.runner.ver }}-build.sh
+      run: |
+        if [[ -f "${BSCRIPT}" ]]; then source ${BSCRIPT}; else source ${BSCRIPT_DEF}; fi
+
+    - name: meson-log-dump
+      run: |
+        cat builddir/meson-logs/meson-log.txt
+
+    - name: Execute 'xnvme enum'
+      run: xnvme enum
+
+    - name: Execute 'xnvme library-info'
+      run: xnvme library-info
+
+  #
+  # Build on Windows
+  #
+  build-windows:
+    needs: [source-archive, source-format-check]
+    runs-on: ${{ matrix.runner.os }}-${{ matrix.runner.ver }}
+    if: ((github.event_name == 'pull_request') || ((github.event_name == 'workflow_dispatch') && ((github.event.inputs.job
+      == 'all') || contains('build-windows', github.event.inputs.job))))
+
+    strategy:
+      matrix:
+        runner:
+        - {os: 'windows', ver: '2019'}
+        - {os: 'windows', ver: '2022'}
+
+    steps:
+    - name: Retrieve the source-archive
+      uses: actions/download-artifact@v2
+      with:
+        name: archive-src
+    - name: Extract the full-source-archive
+      run: |
+        tar xzf xnvme*.tar.gz --strip 1
+        rm xnvme*.tar.gz
+
+    - name: Install build-requirements
+      run: |
+        cmd.exe /c "echo %cd%"
+        cmd.exe /c "toolbox\pkgs\${{ matrix.runner.os }}-${{ matrix.runner.ver }}.bat"
+
+    - name: Build!
+      run: |
+        cmd.exe /c "build.bat"
+
+    - name: Dump the compile-commands and machine
+      run: |
+        cat /proc/cpuinfo || true
+        cat builddir/compile_commands.json || true
+
+    - name: Install
+      shell: cmd
+      run: |
+        cmd.exe /c "build.bat install"
+
+    - name: Execute xnvme commands
+      shell: cmd
+      run: |
+        set "PATH=%SystemDrive%\tools\msys64;!PATH!"
+        set "PATH=%SystemDrive%\tools\msys64\mingw64\bin;!PATH!"
+
+        xnvme.exe enum
+        xnvme.exe library-info
+
+  #
+  # Build on run CIJOE testplans
+  #
+  build-and-test:
+    needs: [source-archive, source-format-check]
+    runs-on: self-hosted
+    if: (((github.event_name == 'workflow_dispatch') && ((github.event.inputs.job == 'all') || (github.event.inputs.job ==
+      'build-and-test'))) || contains(github.event.pull_request.labels.*.name, 'pr-ready-for-test'))
+
+    strategy:
+      matrix:
+        guest:
+        - {os: 'freebsd', ver: '13', img: 'https://refenv.fra1.digitaloceanspaces.com/freebsd13-ufs-ksrc.qcow2'}
+        - {os: 'debian', ver: 'bullseye', img: 'https://cloud.debian.org/images/cloud/bullseye/daily/latest/debian-11-generic-amd64-daily.qcow2'}
+
+    container:
+      image: refenv/qemu-nvme:latest
+      options: --privileged
+
+    steps:
+    - name: Runnner-prep, clean up self-hosted left-overs
+      run: |
+        rm -rf *
+        ls
+
+    - name: Container-prep, get the full-source-archive
+      uses: actions/download-artifact@v2
+      with:
+        name: archive-src
+    - name: Container-prep, extract the full-source-archive
+      run: |
+        tar xzf xnvme*.tar.gz --strip 1
+
+    - name: Provision qemu-guest
+      id: cijoe-qemu
+      uses: refenv/gh-cijoe-qemu-action@main
+      with:
+        vm-image: ${{ matrix.guest.img }}
+        vm-cloudinit: ${{ matrix.guest.os }}-${{ matrix.guest.ver }}
+
+    - name: CIJOE, install cijoe-pkg-xnvme from source-archive
+      run: |
+        pushd toolbox/cijoe-pkg-xnvme && make uninstall && make install-system && popd
+
+    - name: CIJOE, transfer source to qemu-guest
+      run: |
+        pushd $(cij_root) && source modules/cijoe.sh && popd
+        source ${{ steps.cijoe-qemu.outputs.target-env }}
+        ssh.push xnvme*.tar.gz xnvme.tar.gz
+        cij.cmd "tar xzf xnvme.tar.gz --strip 1"
+        cij.cmd "rm xnvme.tar.gz"
+        cij.cmd "df -h"
+
+    - name: CIJOE, install packages
+      run: |
+        pushd $(cij_root) && source modules/cijoe.sh && popd
+        source ${{ steps.cijoe-qemu.outputs.target-env }}
+        cij.cmd "./toolbox/pkgs/${{ matrix.guest.os }}-${{ matrix.guest.ver }}.sh"
+
+    - name: CIJOE, configure xNVMe build
+      run: |
+        pushd $(cij_root) && source modules/cijoe.sh && popd
+        source ${{ steps.cijoe-qemu.outputs.target-env }}
+        cij.cmd "meson setup builddir"
+
+    - name: CIJOE, build xNVMe
+      run: |
+        pushd $(cij_root) && source modules/cijoe.sh && popd
+        source ${{ steps.cijoe-qemu.outputs.target-env }}
+        cij.cmd "meson compile -C builddir"
+
+    - name: CIJOE, build xNVMe dump log on failure
+      if: failure()
+      run: |
+        pushd $(cij_root) && source modules/cijoe.sh && popd
+        source ${{ steps.cijoe-qemu.outputs.target-env }}
+        cij.cmd "cat builddir/meson-logs/meson-log.txt"
+
+    - name: CIJOE, install xNVMe
+      run: |
+        pushd $(cij_root) && source modules/cijoe.sh && popd
+        source ${{ steps.cijoe-qemu.outputs.target-env }}
+        cij.cmd "meson install -C builddir"
+
+    - name: CIJOE, dump fio binary and SPDK io-engines in guest
+      run: |
+        pushd $(cij_root) && source modules/cijoe.sh && popd
+        source ${{ steps.cijoe-qemu.outputs.target-env }}
+        cij.cmd "mkdir -p /opt/aux"
+        cij.cmd "cp subprojects/fio/fio /opt/aux/"
+        cij.cmd "cp subprojects/spdk/build/fio/spdk_bdev /opt/aux/"
+        cij.cmd "cp subprojects/spdk/build/fio/spdk_nvme /opt/aux/"
+        cij.cmd "find /opt/aux"
+        cij.cmd "chmod +x /opt/aux/fio"
+
+    - name: CIJOE, check binaries are available
+      run: |
+        pushd $(cij_root) && source modules/cijoe.sh && popd
+        source ${{ steps.cijoe-qemu.outputs.target-env }}
+        cij.cmd "xnvme enum"
+        cij.cmd "xnvme library-info"
+
+    - name: CIJOE, run Linux testplans using qemu-guest as test-target
+      if: matrix.guest.os == 'debian'
+      run: |
+        pushd $(cij_root) && source modules/cijoe.sh && popd
+        source ${{ steps.cijoe-qemu.outputs.target-env }}
+        cij_runner \
+          --env ${{ steps.cijoe-qemu.outputs.target-env }} \
+          --output ${{ steps.cijoe-qemu.outputs.results }} \
+          --testplan \
+          "${CIJ_TESTPLANS}/xnvme-zns-zrwa-linux-nvme.plan" \
+          "${CIJ_TESTPLANS}/xnvme-zns-zrwa-linux-spdk.plan" \
+          "${CIJ_TESTPLANS}/xnvme-base-linux.plan" \
+          "${CIJ_TESTPLANS}/xnvme-base-spdk.plan" \
+          "${CIJ_TESTPLANS}/xnvme-nvm-spdk.plan" \
+          "${CIJ_TESTPLANS}/xnvme-nvm-linux-nvme.plan" \
+          "${CIJ_TESTPLANS}/xnvme-nvm-linux-null.plan" \
+          "${CIJ_TESTPLANS}/xnvme-zns-spdk.plan" \
+          "${CIJ_TESTPLANS}/xnvme-zns-linux-nvme.plan" \
+          "${CIJ_TESTPLANS}/xnvme-zns-linux-null.plan" \
+          "${CIJ_TESTPLANS}/example_01.plan"
+
+    - name: CIJOE, run FreeBSD testplans using qemu-guest as test-target
+      if: matrix.guest.os == 'freebsd'
+      run: |
+        pushd $(cij_root) && source modules/cijoe.sh && popd
+        source ${{ steps.cijoe-qemu.outputs.target-env }}
+        cij_runner \
+          --env ${{ steps.cijoe-qemu.outputs.target-env }} \
+          --output ${{ steps.cijoe-qemu.outputs.results }} \
+          --testplan \
+          "${CIJ_TESTPLANS}/xnvme-base-fbsd.plan" \
+          "${CIJ_TESTPLANS}/example_01.plan"
+
+    - name: CIJOE, result-log-dump on error
+      if: failure()
+      run: find ${{ steps.cijoe-qemu.outputs.results }} -name "*.log" | xargs cat
+
+    - name: CIJOE, generate report from results
+      if: always()
+      run: |
+        pushd $(cij_root) && source modules/cijoe.sh && popd
+        cij_reporter --output ${{ steps.cijoe-qemu.outputs.results }}
+
+    - name: CIJOE, upload test results and report
+      uses: actions/upload-artifact@v2
+      if: always()
+      with:
+        name: test-results-${{ matrix.guest.os }}-${{ matrix.guest.ver }}
+        path: ${{ steps.cijoe-qemu.outputs.results }}/*
+
+  # This is a lot of effort to generate documentation, however, it ensures that command-line
+  # utilities, build-examples, commands-output of various kinds are up-to-date.
+  # It pushes branches to: docs/<branch>
+  # It pushes tags to: docs/<tag>
+  # and to: docs/latest
+  # The event only triggers on Push events
+  docgen:
+    needs: source-archive
+    runs-on: self-hosted
+    if: ((github.event_name == 'workflow_dispatch') && (github.event.inputs.job == 'docgen'))
+
+    strategy:
+      matrix:
+        guest:
+        - {os: 'debian', ver: 'bullseye', img: 'https://cloud.debian.org/images/cloud/bullseye/daily/latest/debian-11-generic-amd64-daily.qcow2'}
+
+    container:
+      image: refenv/qemu-nvme:latest
+      options: --privileged
+
+    steps:
+    - name: Runnner-prep, clean up self-hosted left-overs
+      run: |
+        rm -rf *
+        ls
+
+    - name: Container-prep, get the full-source-archive
+      uses: actions/download-artifact@v2
+      with:
+        name: archive-src
+    - name: Extract the full-source-archive
+      run: |
+        tar xzf xnvme*.tar.gz --strip 1
+
+    - name: Provision qemu-guest
+      id: cijoe-qemu
+      uses: refenv/gh-cijoe-qemu-action@main
+      with:
+        vm-image: ${{ matrix.guest.img }}
+        vm-cloudinit: ${{ matrix.guest.os }}-${{ matrix.guest.ver }}
+        cijoe-packages: 'cijoe-pkg-xnvme'
+
+    - name: CIJOE, transfer source to qemu-guest
+      run: |
+        pushd $(cij_root) && source modules/cijoe.sh && popd
+        source ${{ steps.cijoe-qemu.outputs.target-env }}
+        ssh.push xnvme*.tar.gz xnvme.tar.gz
+        cij.cmd "tar xzf xnvme.tar.gz --strip 1"
+        cij.cmd "rm xnvme.tar.gz"
+        cij.cmd "df -h"
+
+    - name: CIJOE, install packages
+      run: |
+        pushd $(cij_root) && source modules/cijoe.sh && popd
+        source ${{ steps.cijoe-qemu.outputs.target-env }}
+        cij.cmd "./toolbox/pkgs/${{ matrix.guest.os }}-${{ matrix.guest.ver }}.sh"
+
+    - name: CIJOE/QEMU, Package installation, for xNVMe-docgen
+      run: |
+        pushd $(cij_root) && source modules/cijoe.sh && popd && source ${{ steps.cijoe-qemu.outputs.target-env }}
+        cij.cmd "./docs/autogen/${{ matrix.guest.os }}-${{ matrix.guest.ver }}.sh"
+        cij.cmd "cd docs/autogen && make deps-system"
+
+    - name: CIJOE, configure xNVMe build
+      run: |
+        pushd $(cij_root) && source modules/cijoe.sh && popd
+        source ${{ steps.cijoe-qemu.outputs.target-env }}
+        cij.cmd "meson setup builddir"
+
+    - name: CIJOE, build xNVMe
+      run: |
+        pushd $(cij_root) && source modules/cijoe.sh && popd
+        source ${{ steps.cijoe-qemu.outputs.target-env }}
+        cij.cmd "meson compile -C builddir"
+
+    - name: CIJOE, build xNVMe dump log on failure
+      if: failure()
+      run: |
+        pushd $(cij_root) && source modules/cijoe.sh && popd
+        source ${{ steps.cijoe-qemu.outputs.target-env }}
+        cij.cmd "cat builddir/meson-logs/meson-log.txt"
+
+    - name: CIJOE, install xNVMe
+      run: |
+        pushd $(cij_root) && source modules/cijoe.sh && popd
+        source ${{ steps.cijoe-qemu.outputs.target-env }}
+        cij.cmd "meson install -C builddir"
+
+    - name: CIJOE, install fio
+      run: |
+        pushd $(cij_root) && source modules/cijoe.sh && popd
+        source ${{ steps.cijoe-qemu.outputs.target-env }}
+        cij.cmd "cd subprojects/fio && make install"
+
+    - name: CIJOE, check binaries are available
+      run: |
+        pushd $(cij_root) && source modules/cijoe.sh && popd
+        source ${{ steps.cijoe-qemu.outputs.target-env }}
+        cij.cmd "xnvme enum"
+        cij.cmd "xnvme library-info"
+        cij.cmd "pkg-config xnvme --variable=libdir"
+        cij.cmd "pkg-config xnvme --variable=datadir"
+        cij.cmd "pkg-config xnvme --variable=includedir"
+
+    - name: CIJOE/QEMU, xnvme-docgen generate command-output
+      run: |
+        pushd $(cij_root) && source modules/cijoe.sh && popd && source ${{ steps.cijoe-qemu.outputs.target-env }}
+        cij.cmd "sync; echo 1 > /proc/sys/vm/drop_caches"
+        cij.cmd "cd docs/autogen && make commands"
+
+    - name: CIJOE/QEMU, xnvme-docgen generate doxy, apis and sphinx aka docs
+      run: |
+        pushd $(cij_root) && source modules/cijoe.sh && popd && source ${{ steps.cijoe-qemu.outputs.target-env }}
+        cij.cmd "cd docs/autogen && make docs"
+
+    - name: Transfer from qemu-guest to container
+      run: |
+        pushd $(cij_root) && source modules/cijoe.sh && popd && source ${{ steps.cijoe-qemu.outputs.target-env }}
+        cij.pull "docs/autogen/builddir/html" html-docs
+
+    - name: Checkout site
+      uses: actions/checkout@v3.0.1
+      with:
+        repository: "xnvme/xnvme.github.io"
+        token: ${{ secrets.DOCS_PAT }}
+        path: site
+    - name: Add repos to git-config safe.directory
+      run: |
+        git config --global --add safe.directory $(pwd)/site
+
+    - name: Add docgen to site
+      run: |
+        ./docs/autogen/dest.py --docs html-docs --site site --ref "${{ github.ref }}"
+
+    - name: Push site-changes
+      run: |
+        cd site
+        git config --global user.name 'GitHUB Service'
+        git config --global user.email 'ghs@safl.dk'
+        git add .
+        git commit -a -m "Auto-deployed update of 'docs/' for '${{ github.ref }}'"
+        git push

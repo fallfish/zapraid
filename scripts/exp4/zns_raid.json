@@ -1,0 +1,26 @@
+{
+  "subsystems": [
+    {
+      "subsystem": "bdev",
+      "config": [
+        {
+          "params": {
+            "name": "ZnsRaid0",
+            "block_size": 4096,
+            "num_blocks": 52428800,
+            "system_mode": 3,
+            "num_data_blocks": 2,
+            "num_parity_blocks": 2,
+            "raid_level": 4,
+            "enable_gc": 0,
+            "sync_group_size": 256,
+            "num_open_segments": 1,
+            "inject_degraded_read": 0,
+            "enable_event_framework": 0
+          },
+          "method": "construct_zns_raid_bdev"
+        }
+      ]
+    }
+  ]
+}

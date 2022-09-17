@@ -1,0 +1,96 @@
+---
+exclude: ^(subprojects|third-party)/
+default_language_version:
+  # force all unspecified python hooks to run python3
+  python: python3
+
+repos:
+# C source format; minor difference between .c / .h, much different style for the fio io-engine.
+# For the details, then compare: toolbox/clang-format-*
+- repo: local
+  hooks:
+  - id: clang-format
+    name: C-format-headers
+    language: system
+    entry: toolbox/pcf_clang_format.py
+    args: ["--style-file", "toolbox/clang-format-h"]
+    files: \.h$
+
+  - id: clang-format
+    name: C-format-source
+    language: system
+    entry: toolbox/pcf_clang_format.py
+    args: ["--style-file", "toolbox/clang-format-c"]
+    files: \.c$
+    exclude: xnvme_fioe.c$
+
+  - id: clang-format
+    name: C-format-fioe
+    language: system
+    entry: toolbox/pcf_clang_format.py
+    args: ["--style-file", "toolbox/clang-format-fioe"]
+    files: xnvme_fioe\.c$
+
+# Git: intended for commit-message formating
+#- repo: local
+#  hooks:
+#  - id: commit-msg-check
+#    name: Git-Validate commit message
+#    language: pygrep
+#    entry: '\A(?![A-Za-z]+: .+\nSigned-off-by:.+)'
+#    args: [--multiline]
+#    stages: [commit-msg]
+
+# Yaml: intended for the GitHUB Actions .yaml
+- repo: https://github.com/pre-commit/pre-commit-hooks
+  rev: v4.1.0
+  hooks:
+  - id: check-yaml # pre-commit-hook-yamlfmt only works on valid YAML files
+    name: YAML-format-check
+    types: [file]
+    files: \.(yaml|yml|plan)$
+- repo: https://github.com/jumanjihouse/pre-commit-hook-yamlfmt
+  rev: 0.1.1
+  hooks:
+  - id: yamlfmt
+    name: YAML-format
+    args:
+    - '--mapping=2'
+    - '--sequence=2'
+    - '--offset=0'
+    - '--width=120'
+    - '--preserve-quotes'
+    types: [file]
+    files: \.(yaml|yml|plan)$
+
+# Python: for all the helpers in toolbox/*
+- repo: https://github.com/psf/black
+  rev: '22.3.0'
+  hooks:
+  - id: black
+    name: Python-format-black
+- repo: https://github.com/pycqa/isort
+  rev: '5.10.1'
+  hooks:
+  # Available args: https://pycqa.github.io/isort/docs/configuration/options.html
+  - id: isort
+    name: Python-format-isort
+    args:
+    - '--profile=black'
+    - '--line-length=88'
+- repo: https://github.com/pycqa/flake8
+  rev: '4.0.1'
+  hooks:
+  - id: flake8
+    name: Python-lint-flake8
+    args:
+    - '--max-line-length=88'
+    - '--extend-ignore=E203' # ignore "whitespace before ':'"
+
+# Shell: todo: exclude xnvme-driver.sh
+- repo: https://github.com/jumanjihouse/pre-commit-hooks
+  rev: 2.1.6
+  hooks:
+  - id: shellcheck
+    name: Shell-lint
+    exclude: (xnvme-driver\.sh)|(pkgs.*\.sh)$

@@ -1,0 +1,16 @@
+CUnit-devel
+diffutils
+findutils
+gcc
+gcc-c++
+git
+libaio-devel
+libuuid-devel
+make
+numactl-devel
+openssl-devel
+patch
+pkgconfig
+procps
+python3
+python3-pip

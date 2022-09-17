@@ -1,0 +1,8 @@
+[wrap-git]
+url = https://github.com/axboe/liburing.git
+patch_directory = liburing
+revision = liburing-2.2
+
+[provide]
+uring = uring
+dependency_names = uring

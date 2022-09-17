@@ -1,0 +1,17 @@
+[global]
+ioengine=spdk_bdev
+spdk_json_conf=./zns_raid.json
+thread=1
+group_reporting=1
+direct=1
+verify=0
+time_based=0
+iodepth=2
+
+[test]
+filename=ZnsRaid0
+numjobs=1
+ramp_time=10
+rw=randwrite
+bs=4k
+size=64g
