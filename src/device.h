@@ -37,12 +37,15 @@ public:
   struct spdk_nvme_ctrlr* GetController() { return mController; }
   struct spdk_nvme_ns* GetNamespace() { return mNamespace; }
   struct spdk_nvme_qpair** GetIoQueues() { return mIoQueues; }
-  struct spdk_nvme_qpair* GetIoQueues(uint32_t id) { return mIoQueues[id]; }
+  struct spdk_nvme_qpair* GetIoQueue(uint32_t id) { return mIoQueues[id]; }
 
   uint64_t GetZoneCapacity();
   uint32_t GetNumZones();
 
-  ReadZoneHeaders(std::map<uint64_t, std::pair<uint32_t, uint8_t*>> &zones);
+  void ReadZoneHeaders(std::map<uint64_t, uint8_t*> &zones);
+
+  void SetDeviceTransportAddress(const char *addr);
+  char* GetDeviceTransportAddress() const;
 
 private:
   void issueIo2(spdk_event_fn event_fn, RequestContext *slot);
@@ -63,6 +66,9 @@ private:
 
   std::set<Zone*> mAvailableZones;
   Zone* mZones;
+
+  // indicate the PCIe slot - used to number the drives
+  char mTransportAddress[SPDK_NVMF_TRADDR_MAX_LEN + 1];
 };
 
 #endif

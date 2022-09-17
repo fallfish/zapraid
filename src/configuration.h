@@ -1,10 +1,13 @@
 enum SystemMode {
-  ZONE_WRITE, ZONE_APPEND,
+  ZONEWRITE_ONLY, ZONEAPPEND_ONLY,
   GROUP_LAYOUT, ZAPRAID
 };
 
 enum RAIDLevel {
-  RAID0, RAID1, RAID4, RAID5, RAID6
+  RAID0, RAID1, RAID4, RAID5, RAID6,
+  // For a four-drive setup, RAID01 first stripes the blocks into two drives,
+  // and then replicate the two blocks into four drives during parity generation
+  RAID01,
 };
 
 const static int raid6_4drive_mapping[4][4] = {
@@ -40,14 +43,13 @@ public:
 
   static void PrintConfigurations() {
     Configuration &instance = GetInstance();
-    const char *systemModeStrs[] = {"Pure write", "Pure zone append", "ZnsRaid no meta", "ZnsRaid with meta", "ZnsRaid with redirection"};
-    printf("ZNS RAID Configuration:\n");
+    const char *systemModeStrs[] = {"ZoneWrite-Only", "ZoneAppend-Only", "GroupLayout", "ZapRAID"};
+    printf("ZapRAID Configuration:\n");
     printf("-- Raid mode: %d %d %d --\n",
         instance.gStripeDataSize,
         instance.gStripeParitySize,
         instance.gRaidScheme);
     printf("-- System mode: %s --\n", systemModeStrs[(int)instance.gSystemMode]);
-    printf("-- Stripe Persistency Mode: %d --\n", instance.gStripePersistencyMode);
     printf("-- GC Enable: %d --\n", instance.gEnableGc);
   }
 
@@ -130,7 +132,6 @@ public:
   }
 
   static void SetRaidLevel(RAIDLevel level) {
-    printf("Set raid level: %d\n", (int)level);
     GetInstance().gRaidScheme = level;
   }
 
@@ -158,8 +159,8 @@ public:
     return false;
   }
 
-  static bool GetEventFrameworkEnabled() {
-    return true;
+  static void SetIsBrandNew(bool isNew) {
+    GetInstance().gIsBrandNew = isNew;
   }
 
   static bool GetIsBrandNew() {
@@ -198,12 +199,32 @@ public:
     return GetInstance().gStorageSpaceInBytes;
   }
 
+  static void SetEnableEventFramework(bool enable) {
+    GetInstance().gEnableEventFramework = enable;
+  }
+
+  static bool GetEventFrameworkEnabled() {
+    return GetInstance().gEnableEventFramework;
+  }
+
+  static void SetEnableRedirection(bool enable) {
+    GetInstance().gEnableRedirection = enable;
+  }
+
+  static bool GetRedirectionEnable() {
+    return GetInstance().gEnableRedirection;
+  }
+
+
   static uint32_t CalculateDiskId(uint32_t stripeId, uint32_t whichBlock, RAIDLevel raidScheme, uint32_t numDisks) {
     // calculate which disk current block (data/parity) should go
     uint32_t driveId = ~0u;
     uint32_t idOfGroup = stripeId % numDisks;
 
-    if (raidScheme == RAID0 || raidScheme == RAID1 || raidScheme == RAID4) {
+    if (raidScheme == RAID0
+        || raidScheme == RAID1
+        || raidScheme == RAID01
+        || raidScheme == RAID4) {
       driveId = whichBlock;
     } else if (raidScheme == RAID5) {
       // Example: 0 1 P
@@ -249,7 +270,7 @@ private:
   int gBlockSize = 4096;
   int gMetadataSize = 64;
   int gNumIoThreads = 1;
-  bool gDeviceSupportMetadata = false;
+  bool gDeviceSupportMetadata = true;
   int gZoneCapacity = 0;
   int gStripePersistencyMode = 0;
   bool gEnableGc = true;
@@ -258,16 +279,21 @@ private:
   uint32_t gNumOpenSegments = 1;
   RAIDLevel gRaidScheme = RAID5;
   bool gEnableHeaderFooter = true;
+  bool gEnableRedirection = false;
 
-  uint64_t gStorageSpaceInBytes = 10 * 1024 * 1024 * 1024ull;
+  uint64_t gStorageSpaceInBytes = 1024 * 1024 * 1024 * 1024ull; // 1TiB
 
   SystemMode gSystemMode = ZAPRAID;
 
-  uint32_t gReceiverThreadCoreId = 2;
-  uint32_t gDispatchThreadCoreId = 3;
-  uint32_t gCompletionThreadCoreId = 4;
-  uint32_t gIndexThreadCoreId = 5;
-  uint32_t gEcThreadCoreId = 6;
-  uint32_t gIoThreadCoreIdBase = 7;
+  uint32_t gReceiverThreadCoreId = 3;
+  uint32_t gDispatchThreadCoreId = 4;
+  // Not used for now; functions collocated with dispatch thread.
+  uint32_t gCompletionThreadCoreId = 5;
+  uint32_t gIndexThreadCoreId = 6;
+  uint32_t gEcThreadCoreId = 7;
+  uint32_t gIoThreadCoreIdBase = 8;
+
+  // SPDK target adopts the reactors framework, and we should not manually initiate any SPDK thread
+  bool gEnableEventFramework = false;
 };
 

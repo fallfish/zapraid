@@ -4,7 +4,7 @@
 #include <sys/time.h>
 #include "raid_controller.h"
 #include "zone.h"
-#include "poller.h"
+#include "messages_and_functions.h"
 
 #include "spdk/nvme.h"
 
@@ -12,69 +12,69 @@
 static void writeComplete(void *arg, const struct spdk_nvme_cpl *completion)
 {
   RequestContext *slot = (RequestContext*)arg;
-  slot->successBytes += Configuration::GetStripeUnitSize();
-  slot->Queue();
 
   if (spdk_nvme_cpl_is_error(completion)) {
+    slot->PrintStats();
     fprintf(stderr, "I/O error status: %s\n", spdk_nvme_cpl_get_status_string(&completion->status));
     fprintf(stderr, "Write I/O failed, aborting run\n");
-  slot->PrintStats();
+    assert(0);
     exit(1);
   }
+
+  slot->successBytes += Configuration::GetStripeUnitSize();
+  slot->Queue();
 };
 
 static void readComplete(void *arg, const struct spdk_nvme_cpl *completion)
 {
   RequestContext *slot = (RequestContext*)arg;
-  slot->successBytes += Configuration::GetStripeUnitSize();
-  slot->Queue();
-
   if (spdk_nvme_cpl_is_error(completion)) {
     slot->PrintStats();
     fprintf(stderr, "I/O error status: %s\n", spdk_nvme_cpl_get_status_string(&completion->status));
     fprintf(stderr, "Read I/O failed, aborting run\n");
     exit(1);
   }
+
+  slot->successBytes += Configuration::GetStripeUnitSize();
+  slot->Queue();
 };
 
 static void resetComplete(void *arg, const struct spdk_nvme_cpl *completion)
 {
   RequestContext *slot = (RequestContext*)arg;
-  slot->Queue();
-
   if (spdk_nvme_cpl_is_error(completion)) {
     fprintf(stderr, "I/O error status: %s\n", spdk_nvme_cpl_get_status_string(&completion->status));
     fprintf(stderr, "Reset I/O failed, aborting run\n");
     exit(1);
   }
+
+  slot->Queue();
 };
 
 
 static void finishComplete(void *arg, const struct spdk_nvme_cpl *completion)
 {
   RequestContext *slot = (RequestContext*)arg;
-  slot->Queue();
-
   if (spdk_nvme_cpl_is_error(completion)) {
     fprintf(stderr, "I/O error status: %s\n", spdk_nvme_cpl_get_status_string(&completion->status));
     fprintf(stderr, "Finish I/O failed, aborting run\n");
     exit(1);
   }
+  slot->Queue();
 };
 
 static void appendComplete(void *arg, const struct spdk_nvme_cpl *completion)
 {
   RequestContext *slot = (RequestContext*)arg;
-  slot->successBytes += Configuration::GetStripeUnitSize();
-//  printf("Offset: %x %x %d %d %d\n", slot->offset, completion->cdw0, slot->offset, completion->cdw0, slot->offset & completion->cdw0);
-  slot->offset = slot->offset & completion->cdw0;
-  slot->Queue();
-
   if (spdk_nvme_cpl_is_error(completion)) {
     fprintf(stderr, "I/O error status: %s\n", spdk_nvme_cpl_get_status_string(&completion->status));
     fprintf(stderr, "Append I/O failed, aborting run\n");
     exit(1);
   }
+
+  slot->successBytes += Configuration::GetStripeUnitSize();
+  slot->offset = slot->offset & completion->cdw0;
+  slot->Queue();
 };
 
 inline uint64_t Device::bytes2Block(uint64_t bytes)
@@ -94,8 +94,8 @@ void Device::Init(struct spdk_nvme_ctrlr *ctrlr, int nsid)
 
   mZoneSize = spdk_nvme_zns_ns_get_zone_size_sectors(mNamespace);
   mNumZones = spdk_nvme_zns_ns_get_num_zones(mNamespace);
-  mZoneCapacity = 1077 * 256;
-  printf("Zone size: %d, zone cap: %d, num of zones: %d\n", mZoneSize, mZoneCapacity, mNumZones);
+  mZoneCapacity = 1077 * 256; // hard-coded here since it is ZN540; update this for emulated SSDs
+  printf("Zone size: %lu, zone cap: %lu, num of zones: %u\n", mZoneSize, mZoneCapacity, mNumZones);
 
   struct spdk_nvme_io_qpair_opts opts;
   spdk_nvme_ctrlr_get_default_io_qpair_opts(mController, &opts, sizeof(opts));
@@ -135,7 +135,8 @@ void Device::EraseWholeDevice()
 void Device::InitZones(uint32_t numNeededZones, uint32_t numReservedZones)
 {
   if (numNeededZones + numReservedZones > mNumZones) {
-    printf("Warning! The real storage space is not sufficient for the setting, %u %u %u\n", numNeededZones, numReservedZones, mNumZones);
+    printf("Warning! The real storage space is not sufficient for the setting,"
+        "%u %u %u\n", numNeededZones, numReservedZones, mNumZones);
   }
   mNumZones = std::min(mNumZones, numNeededZones + numReservedZones);
   mZones = new Zone[mNumZones];
@@ -163,7 +164,7 @@ Zone* Device::OpenZone()
 Zone* Device::OpenZoneBySlba(uint64_t slba)
 {
   uint32_t zid = slba / mZoneSize;
-  Zone *zone = mZones[zid];
+  Zone *zone = &mZones[zid];
 
   assert(mAvailableZones.find(zone) != mAvailableZones.end());
   mAvailableZones.erase(zone);
@@ -304,8 +305,7 @@ void Device::Read(uint64_t offset, uint32_t size, void* ctx)
 
 void Device::AddAvailableZone(Zone *zone)
 {
-  assert(mUsedZones.find(zone->GetSlba()) != mUsedZones.end());
-  mAvailableZones.push_back(zone);
+  mAvailableZones.insert(zone);
 }
 
 uint64_t Device::GetZoneCapacity()
@@ -318,30 +318,34 @@ uint32_t Device::GetNumZones()
   return mNumZones;
 }
 
+void b();
 void Device::ReadZoneHeaders(std::map<uint64_t, uint8_t*> &zones)
 {
   bool done = false;
   auto complete = [](void *arg, const struct spdk_nvme_cpl *completion) {
     bool *done = (bool*)arg;
     *done = true;
-  }
+  };
 
   // Read zone report
+  uint32_t nr_zones = spdk_nvme_zns_ns_get_num_zones(mNamespace);
   struct spdk_nvme_zns_zone_report *report;
-  uint32_t report_bytes = sizeof(report->descs[0]) * mNumZones + sizeof(*report);
+  uint32_t report_bytes = sizeof(report->descs[0]) * nr_zones + sizeof(*report);
   report = (struct spdk_nvme_zns_zone_report *)calloc(1, report_bytes);
-  spdk_nvme_zns_report_zones(mNamespace, mIoQueues[0], &states, 4096, 0,
+  spdk_nvme_zns_report_zones(mNamespace, mIoQueues[0], report, report_bytes, 0,
                              SPDK_NVME_ZRA_LIST_ALL, false, complete, &done);
-  while (!done) ;
+  while (!done) {
+    spdk_nvme_qpair_process_completions(mIoQueues[0], 0);
+  }
 
   for (uint32_t i = 0; i < report->nr_zones; ++i) {
-    struct spdk_nvme_zns_desc *zdesc = &report->descs[i];
+    struct spdk_nvme_zns_zone_desc *zdesc = &(report->descs[i]);
     uint64_t wp = ~0ull;
     uint64_t zslba = zdesc->zslba;
 
     if (zdesc->zs == SPDK_NVME_ZONE_STATE_FULL
         || zdesc->zs == SPDK_NVME_ZONE_STATE_IOPEN 
-        || zdesc->zs == ZONE_STATE_EOPEN) {
+        || zdesc->zs == SPDK_NVME_ZONE_STATE_EOPEN) {
       if (zdesc->wp != zslba) {
         wp = zdesc->wp;
       }
@@ -351,7 +355,7 @@ void Device::ReadZoneHeaders(std::map<uint64_t, uint8_t*> &zones)
       continue;
     }
 
-    uint8_t *buffer = spdk_zmalloc(Configuration::GetBlockSize(), 4096,
+    uint8_t *buffer = (uint8_t*)spdk_zmalloc(Configuration::GetBlockSize(), 4096,
                                    NULL, SPDK_ENV_SOCKET_ID_ANY,
                                    SPDK_MALLOC_DMA);
     done = false;
@@ -363,5 +367,14 @@ void Device::ReadZoneHeaders(std::map<uint64_t, uint8_t*> &zones)
     zones[wp] = buffer;
   }
 
-  return zones;
+  free(report);
+}
+
+void Device::SetDeviceTransportAddress(const char *addr) {
+  memcpy(mTransportAddress, addr, SPDK_NVMF_TRADDR_MAX_LEN + 1);
+}
+
+char* Device::GetDeviceTransportAddress() const
+{
+  return (char*)mTransportAddress;
 }

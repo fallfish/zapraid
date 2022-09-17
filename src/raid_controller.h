@@ -49,6 +49,15 @@ public:
   void Execute(uint64_t offset, uint32_t size, void* data, bool is_write,
       zns_raid_request_complete cb_fn, void *cb_args);
 
+  void EnqueueWrite(RequestContext *ctx);
+  void EnqueueReadPrepare(RequestContext *ctx);
+  void EnqueueReadReaping(RequestContext *ctx);
+  std::queue<RequestContext*>& GetWriteQueue();
+  std::queue<RequestContext*>& GetReadPrepareQueue();
+  std::queue<RequestContext*>& GetReadReapingQueue();
+
+  std::queue<RequestContext*>& GetEventsToDispatch();
+
   /**
    * @brief Drain the RAID system to finish all the in-flight requests
    */
@@ -109,13 +118,6 @@ public:
   struct spdk_thread *GetCompletionThread();
 
   /**
-   * @brief Get the Events To Dispatch object
-   * 
-   * @return std::vector<RequestContext*>& 
-   */
-  std::vector<RequestContext*>& GetEventsToDispatch();
-
-  /**
    * @brief Find a PhysicalAddress given a LogicalAddress of a block
    * 
    * @param lba the logial address of the queried block
@@ -127,12 +129,13 @@ public:
 
   void ReclaimContexts();
   void Flush();
+  void Dump();
 
-  GcTask* GetGcTask();
   uint32_t GetHeaderRegionSize();
   uint32_t GetDataRegionSize();
   uint32_t GetFooterRegionSize();
 
+  GcTask* GetGcTask();
   void RemoveRequestFromGcEpochIfNecessary(RequestContext *ctx);
 private:
   RequestContext* getContextForUserRequest();
@@ -154,11 +157,11 @@ private:
   bool progressGcReader();
 
   std::vector<Device*> mDevices;
-  std::unordered_map<uint64_t, PhysicalAddr> *mAddressMap;
-  std::vector<Segment*> mSealedSegments;
+  std::unordered_set<Segment*> mSealedSegments;
   std::vector<Segment*> mSegmentsToSeal;
   std::vector<Segment*> mOpenSegments;
   Segment* mSpareSegment;
+  PhysicalAddr *mAddressMap;
 
   RequestContextPool *mRequestContextPoolForUserRequests;
   std::unordered_set<RequestContext*> mInflightRequestContext;
@@ -183,7 +186,10 @@ private:
   int64_t mNumInvalidBlocks = 0;
   int64_t mNumBlocks = 0;
 
-  std::vector<RequestContext*> mEventsToDispatch;
+  std::queue<RequestContext*> mEventsToDispatch;
+  std::queue<RequestContext*> mWriteQueue;
+  std::queue<RequestContext*> mReadPrepareQueue;
+  std::queue<RequestContext*> mReadReapingQueue;
 
   uint32_t mAvailableStorageSpaceInSegments = 0;
   uint32_t mStorageSpaceThresholdForGcInSegments = 0;

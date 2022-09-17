@@ -73,9 +73,14 @@ uint32_t Zone::GetLength()
   return mCapacity;
 }
 
+uint32_t Zone::GetSize()
+{
+  return mSize;
+}
+
 void Zone::PrintStats()
 {
-  printf("device id: %d, slba: %d, length: %d\n",
+  printf("device id: %d, slba: %lu, length: %d\n",
       GetDeviceId(), mSlba, mCapacity);
 }
 

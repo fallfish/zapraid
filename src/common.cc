@@ -1,10 +1,22 @@
 #include "common.h"
 #include "segment.h"
 #include "raid_controller.h"
-#include "poller.h"
+#include "messages_and_functions.h"
 #include <spdk/event.h>
 #include <sys/time.h>
 #include <queue>
+
+void completeOneEvent(void *arg, const struct spdk_nvme_cpl *completion)
+{
+  uint32_t *counter = (uint32_t*)arg;
+  (*counter)--;
+}
+
+void complete(void *arg, const struct spdk_nvme_cpl *completion)
+{
+  bool *done = (bool*)arg;
+  *done = true;
+}
 
 void thread_send_msg(spdk_thread *thread, spdk_msg_fn fn, void *args)
 {
@@ -25,10 +37,7 @@ void event_call(uint32_t core_id, spdk_event_fn fn, void *arg1, void *arg2)
 }
 
 void PhysicalAddr::PrintOffset() {
-  uint32_t deviceId = segment->GetZones()[zoneId]->GetDeviceId();
-  uint32_t pba = segment->GetZones()[zoneId]->GetSlba();
-  printf("phyAddr: deviceId: %u, stripeId: %u, pba: %u\n",
-         deviceId, stripeId, pba + offset);
+  printf("phyAddr: segment: %p, zid: %u, offset: %u\n", segment, zoneId, offset);
 }
 
 void RequestContext::Clear()
@@ -57,7 +66,6 @@ void RequestContext::Clear()
 
 double RequestContext::GetElapsedTime()
 {
-//  printf("Get elapsed time: %p %lf %lf\n", this, mStime, mCtime);
   return ctime - stime;
 }
 
@@ -72,8 +80,8 @@ PhysicalAddr RequestContext::GetPba()
 
 void RequestContext::Queue()
 {
-  struct spdk_thread *th = ctrl->GetDispatchThread();
   if (!Configuration::GetEventFrameworkEnabled()) {
+    struct spdk_thread *th = ctrl->GetDispatchThread();
     thread_send_msg(ctrl->GetDispatchThread(), handleEventCompletion, this);
   } else {
     event_call(Configuration::GetDispatchThreadCoreId(),
@@ -83,15 +91,18 @@ void RequestContext::Queue()
 
 void RequestContext::PrintStats()
 {
-  printf("RequestStats: %d %d %lu %d, iocontext: %p %p %lu %d\n", type, status, lba, size, ioContext.data, ioContext.metadata, ioContext.offset, ioContext.size);
+  printf("RequestStats: %d %d %lu %d, iocontext: %p %p %lu %d\n",
+      type, status, lba, size,
+      ioContext.data, ioContext.metadata,
+      ioContext.offset, ioContext.size);
 }
 
 double timestamp()
 {
-  return 0;
   // struct timeval s;
   // gettimeofday(&s, NULL);
   // return s.tv_sec + s.tv_usec / 1000000.0;
+  return 0;
 }
 
 double gettimediff(struct timeval s, struct timeval e)
@@ -138,7 +149,6 @@ void RequestContext::CopyFrom(const RequestContext &o) {
   gcTask = o.gcTask;
 }
 
-// Pools
 RequestContextPool::RequestContextPool(uint32_t cap) {
   capacity = cap;
   contexts = new RequestContext[capacity];
@@ -219,23 +229,9 @@ ReadContext* ReadContextPool::GetContext() {
   if (!availableContexts.empty()) {
     context = availableContexts.back();
     availableContexts.pop_back();
-    // inflightContexts.emplace_back(context);
   }
 
   return context;
-}
-
-void ReadContextPool::Recycle() {
-  for (auto it = inflightContexts.begin();
-      it != inflightContexts.end();
-      ) {
-    if (checkReadAvailable(*it)) {
-      availableContexts.emplace_back(*it);
-      it = inflightContexts.erase(it);
-    } else {
-      ++it;
-    }
-  }
 }
 
 void ReadContextPool::ReturnContext(ReadContext *readContext)
@@ -300,7 +296,7 @@ StripeWriteContext* StripeWriteContextPool::GetContext() {
   }
 
   StripeWriteContext *stripe = availableContexts.back();
-  inflightContexts.emplace_back(stripe);
+  inflightContexts.insert(stripe);
   availableContexts.pop_back();
 
   return stripe;

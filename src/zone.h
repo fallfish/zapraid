@@ -19,6 +19,7 @@ public:
   void AdvancePos();
   uint32_t GetSlba();
   uint32_t GetLength();
+  uint32_t GetSize();
 
   void PrintStats();
 private:

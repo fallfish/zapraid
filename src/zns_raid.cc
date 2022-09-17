@@ -2,7 +2,8 @@
 
 extern "C" void* zns_raid_create(void)
 {
-  RAIDController *ctrl = new RAIDController();
+  static RAIDController *ctrl = nullptr;
+  ctrl = new RAIDController();
   ctrl->Init(false);
   
   return ctrl;
@@ -69,5 +70,9 @@ extern "C" void zns_raid_set_header_footer(uint32_t enable_header_footer) {
 
 extern "C" void zns_raid_set_storage_space_in_bytes(uint64_t storage_space_in_bytes) {
   Configuration::SetStorageSpaceInBytes(storage_space_in_bytes);
+}
+
+extern "C" void zns_raid_set_enable_event_framework(bool enable) {
+  Configuration::SetEnableEventFramework(enable);
 }
 

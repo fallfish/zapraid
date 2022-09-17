@@ -16,7 +16,7 @@
 #include <algorithm>
 
 #include "zone.h"
-#include "poller.h"
+#include "messages_and_functions.h"
 
 static void busyWait(bool *ready)
 {
@@ -39,9 +39,11 @@ static auto attach_cb = [](void *cb_ctx,
     const struct spdk_nvme_transport_id *trid,
     struct spdk_nvme_ctrlr *ctrlr,
     const struct spdk_nvme_ctrlr_opts *opts) -> void {
+
   for (int nsid = 1; nsid <= 1; nsid++) {
     Device* device = new Device();
     device->Init(ctrlr, nsid);
+    device->SetDeviceTransportAddress(trid->traddr);
     g_devices.emplace_back(device);
   }
 
@@ -59,7 +61,9 @@ void RAIDController::initEcThread()
   spdk_cpuset_zero(&cpumask);
   spdk_cpuset_set_cpu(&cpumask, Configuration::GetEcThreadCoreId(), true);
   mEcThread = spdk_thread_create("ECThread", &cpumask);
-  printf("Create EC processing thread %s %d\n", spdk_thread_get_name(mEcThread), spdk_thread_get_id(mEcThread));
+  printf("Create EC processing thread %s %lu\n",
+      spdk_thread_get_name(mEcThread),
+      spdk_thread_get_id(mEcThread));
   int rc = spdk_env_thread_launch_pinned(Configuration::GetEcThreadCoreId(), ecWorker, this);
   if (rc < 0) {
     printf("Failed to launch ec thread error: %s\n", spdk_strerror(rc));
@@ -134,7 +138,7 @@ void RAIDController::Init(bool need_env)
   if (need_env) {
     struct spdk_env_opts opts;
     spdk_env_opts_init(&opts);
-    opts.core_mask = "0xff";
+    opts.core_mask = "0x1ff";
     if (spdk_env_init(&opts) < 0) {
       fprintf(stderr, "Unable to initialize SPDK env.\n");
       exit(-1);
@@ -155,6 +159,10 @@ void RAIDController::Init(bool need_env)
 
   // init devices
   mDevices = g_devices;
+  std::sort(mDevices.begin(), mDevices.end(), [](const Device *o1, const Device *o2) -> bool {
+      // there will be no tie between two PCIe address, so no issue without equality test
+        return strcmp(o1->GetDeviceTransportAddress(), o2->GetDeviceTransportAddress()) < 0;
+      });
 
   // Adjust the capacity for user data = total capacity - footer size
   // The L2P table information at the end of the segment
@@ -186,13 +194,17 @@ void RAIDController::Init(bool need_env)
   printf("Total available segments: %u, reserved segments: %u\n", mAvailableStorageSpaceInSegments, mStorageSpaceThresholdForGcInSegments);
 
   // Preallocate contexts for user requests
-  mRequestContextPoolForUserRequests = new RequestContextPool(256);
-  mRequestContextPoolForSegments = new RequestContextPool(4096 * 2);
+  // Sufficient to support multiple I/O queues of NVMe-oF target
+  mRequestContextPoolForUserRequests = new RequestContextPool(2048);
+  mRequestContextPoolForSegments = new RequestContextPool(4096);
 
-  mReadContextPool = new ReadContextPool(4096, mRequestContextPoolForSegments);
+  mReadContextPool = new ReadContextPool(512, mRequestContextPoolForSegments);
 
   // Initialize address map
-  mAddressMap = new std::unordered_map<uint64_t, PhysicalAddr>();
+  mAddressMap = new PhysicalAddr[Configuration::GetStorageSpaceInBytes() / Configuration::GetBlockSize()];
+  PhysicalAddr defaultAddr;
+  defaultAddr.segment = nullptr;
+  std::fill(mAddressMap, mAddressMap + Configuration::GetStorageSpaceInBytes() / Configuration::GetBlockSize(), defaultAddr);
 
   // Create poll groups for the io threads and perform initialization
   for (uint32_t threadId = 0; threadId < Configuration::GetNumIoThreads(); ++threadId) {
@@ -208,77 +220,110 @@ void RAIDController::Init(bool need_env)
     mDevices[i]->ConnectIoPairs();
   }
 
+  // Preallocate segments
+  mNumOpenSegments = Configuration::GetNumOpenSegments();
+
+  mStripeWriteContextPools = new StripeWriteContextPool *[mNumOpenSegments + 2];
+  for (uint32_t i = 0; i < mNumOpenSegments + 2; ++i) {
+    if (Configuration::GetSystemMode() == ZONEWRITE_ONLY) {
+      mStripeWriteContextPools[i] = new StripeWriteContextPool(1, mRequestContextPoolForSegments);
+    } else {
+      mStripeWriteContextPools[i] = new StripeWriteContextPool(64, mRequestContextPoolForSegments);
+    }
+  }
+
+  mOpenSegments.resize(mNumOpenSegments);
+
+
   if (Configuration::GetIsBrandNew()) {
     for (uint32_t i = 0; i < mDevices.size(); ++i) {
       mDevices[i]->EraseWholeDevice();
     }
   } else {
+    std::pair<uint64_t, PhysicalAddr> *indexMap = 
+      new std::pair<uint64_t, PhysicalAddr>[Configuration::GetStorageSpaceInBytes() / Configuration::GetBlockSize()];
+    std::pair<uint64_t, PhysicalAddr> defaultAddr;
+    defaultAddr.first = 0;
+    defaultAddr.second.segment = nullptr;
+    std::fill(indexMap, indexMap + Configuration::GetStorageSpaceInBytes() / Configuration::GetBlockSize(), defaultAddr);
+
+    struct timeval s, e;
+    gettimeofday(&s, NULL);
     // Mount from an existing new array
     // Reconstruct existing segments
-
     uint32_t zoneSize = 2 * 1024 * 1024 / 4;
     // Valid (full and open) zones and their headers
-    std::map<uint64_t, uint8_t*> zonesAndHeaders[mDevice.size()];
-    // Segment ID to SegmentMetadata
-    std::map<uint32_t, std::vector<std::pair<uint64_t, SegmentMetadata*>>> potentialSegments; 
+    std::map<uint64_t, uint8_t*> zonesAndHeaders[mDevices.size()];
+    // Segment ID to (wp, SegmentMetadata)
+    std::map<uint32_t, std::vector<std::pair<uint64_t, uint8_t*>>> potentialSegments; 
 
     for (uint32_t i = 0; i < mDevices.size(); ++i) {
       mDevices[i]->ReadZoneHeaders(zonesAndHeaders[i]);
       for (auto zoneAndHeader : zonesAndHeaders[i]) {
-        uint64_t zslba = zoneAndHeader.first;
-        uint32_t wp = zoneAndHeader.second.first;
-        SegmentMetadata *segMeta = (SegmentMetadata*)zoneAndHeader.second.second;
-        potentialSegments[segMeta->segmentId].emplace_back(std::pair(wp, segMeta));
+        uint64_t wp = zoneAndHeader.first;
+        SegmentMetadata *segMeta = reinterpret_cast<SegmentMetadata*>(zoneAndHeader.second);
+        if (potentialSegments.find(segMeta->segmentId) == potentialSegments.end()) {
+          potentialSegments[segMeta->segmentId].resize(mDevices.size());
+        }
+        potentialSegments[segMeta->segmentId][i] = std::pair(wp, zoneAndHeader.second);
       }
     }
 
     // Filter out invalid segments
-    for (auto it = potentialSegments->begin();
-         it != potentialSegments->end(); ) {
+    for (auto it = potentialSegments.begin();
+         it != potentialSegments.end(); ) {
       auto &zones = it->second;
       bool isValid = true;
-      if (zones.size() != mDevices.size()) {
-        // not a valid segment; because not enough zones given
-        isValid = false;
-      }
 
-      if (isValid) {
-        SegmentMetadata *segMeta = nullptr;
-        for (auto zone : zones) {
-          if (segMeta == nullptr) {
-            segMeta = zone.second;
-          }
-
-          if (memcmp(segMeta, zoneSegMeta, sizeof(SegmentMeta)) != 0) {
-            // TODO: Handle corrupted segment metadata
-            isValid = false;
-            break;
-          }
+      SegmentMetadata *segMeta = nullptr;
+      for (uint32_t i = 0; i < mDevices.size(); ++i) {
+        auto zone = zones[i];
+        if (zone.second == nullptr) {
+          isValid = false;
+          break;
         }
 
-        printf("segment ID: %llu, n: %u, k: %u, numZones: %u\n",
-            segMeta->segmentId, segMeta->n, segMeta->k, segMeta->numZones);
+        if (segMeta == nullptr) {
+          segMeta = reinterpret_cast<SegmentMetadata*>(zone.second);
+        }
+
+        if (memcmp(segMeta, zone.second, sizeof(SegmentMetadata)) != 0) {
+          isValid = false;
+          break;
+        }
       }
 
       if (!isValid) {
-        for (zone : zones) {
-          spdk_free(zone.second); // free the allocated metadata memory
+        for (uint32_t i = 0; i < mDevices.size(); ++i) {
+          auto zone = zones[i];
+          uint64_t wp = zone.first;
+          SegmentMetadata *segMeta = reinterpret_cast<SegmentMetadata*>(zone.second);
+          bool done = false;
+          if (spdk_nvme_zns_reset_zone(mDevices[i]->GetNamespace(),
+              mDevices[i]->GetIoQueue(0),
+              segMeta->zones[i],
+              0, complete, &done) != 0) {
+            printf("Reset error during recovery\n");
+          }
+          while (!done) {
+            spdk_nvme_qpair_process_completions(mDevices[i]->GetIoQueue(0), 0);
+          }
+          spdk_free(segMeta); // free the allocated metadata memory
         }
-        it = potentialSegments->erase(it);
+        it = potentialSegments.erase(it);
       } else {
         ++it;
       }
     }
 
-    std::map<uint64_t, std::pair<uint64_t, PhysicalAddr>> indexMap;
     // reconstruct all open, sealed segments (Segment Table)
-    for (auto it = potentialSegments->begin();
-         it != potentialSegments->end(); ) {
+    for (auto it = potentialSegments.begin();
+         it != potentialSegments.end(); ++it) {
       uint32_t segmentId = it->first;
       auto &zones = it->second;
       RequestContextPool *rqPool = mRequestContextPoolForSegments;
       ReadContextPool *rdPool = mReadContextPool;
-      StripeWriteContext *wPool = nullptr;
+      StripeWriteContextPool *wPool = nullptr;
 
       mNextAssignedSegmentId = std::max(segmentId + 1, mNextAssignedSegmentId);
 
@@ -288,57 +333,112 @@ void RAIDController::Init(bool need_env)
       SegmentMetadata *segMeta = nullptr;
       for (auto zone : zones) {
         segWp = std::min(segWp, zone.first % zoneSize);
-        segMeta = zone.second;
+        segMeta = reinterpret_cast<SegmentMetadata*>(zone.second);
       }
+      Segment *seg = nullptr;
       if (segWp == zoneCapacity) {
         // sealed
-        Segment *seg = new Segment(this, segmentId, rqPool, rdPool, wPool);
+        seg = new Segment(this, segmentId, rqPool, rdPool, wPool);
         for (uint32_t i = 0; i < segMeta->numZones; ++i) {
           Zone *zone = mDevices[i]->OpenZoneBySlba(segMeta->zones[i]);
           seg->AddZone(zone);
         }
-        seg->SetStatus(SEGMENT_SEALED);
+        seg->SetSegmentStatus(SEGMENT_SEALED);
         mSealedSegments.insert(seg);
-
-        // Read the footer region for recovering L2P table
-        seg->RecoverIndexUsingFooter(indexMap);
       } else {
+        // We assume at most one open segment is created
         wPool = mStripeWriteContextPools[0];
         // open
-        Segment *seg = new Segment(this, segmentId, rqPool, rdPool, wPool);
+        seg = new Segment(this, segmentId, rqPool, rdPool, wPool);
         for (uint32_t i = 0; i < segMeta->numZones; ++i) {
           Zone *zone = mDevices[i]->OpenZoneBySlba(segMeta->zones[i]);
           seg->AddZone(zone);
         }
-        segments[0] = seg;
-        seg->SetStatus(SEGMENT_NORMAL);
-
-        seg->RecoverIndexMapUsingBlocks(indexMap, zones);
+        mOpenSegments[0] = seg;
+        seg->SetSegmentStatus(SEGMENT_NORMAL);
       }
+      seg->SetZonesAndWpForRecovery(zones);
+    }
 
-      for (auto pr : indexMap) {
-        PhysicalAddr pba = pr.second.second;
-        mAddressMap[pr.first] = mAddressMap[pr.second.second];
-        pba.segment->FinishBlock(pba.zoneId, pba.offset, pba.lba);
-      }
-
-      for (Segment *segment : mSealedSegments) {
-        segment->FinishRecovery();
-      }
-
-      for (Segment *segment : mSegmentsToSeal) {
-        segment->FinishRecovery();
-      }
-
-      for (Segment *segment : mOpenSegments) {
-        segment->FinishRecovery();
-      }
-
-      if (mOpenSegments.size() >= 1) {
-        printf("We should not have multiple open segments.\n");
+    // For open segment: seal it if needed (position >= data region size)
+    printf("Load all blocks of open segments.\n");
+    for (uint32_t i = 0; i < mNumOpenSegments; ++i) {
+      if (mOpenSegments[i] != nullptr) {
+        mOpenSegments[i]->RecoverLoadAllBlocks();
+        if (mOpenSegments[i]->RecoverFooterRegionIfNeeded()) {
+          mSealedSegments.insert(mOpenSegments[i]);
+          mOpenSegments[i] = nullptr;
+        }
       }
     }
 
+    printf("Recover stripe consistency.\n");
+    // For open segment: recover stripe consistency
+    for (uint32_t i = 0; i < mNumOpenSegments; ++i) {
+      if (mOpenSegments[i] != nullptr) {
+        if (mOpenSegments[i]->RecoverNeedRewrite()) {
+          Segment *newSeg = new Segment(this, mOpenSegments[i]->GetSegmentId(),
+              mRequestContextPoolForSegments,
+              mReadContextPool,
+              mStripeWriteContextPools[i]);
+          for (uint32_t j = 0; i < mOpenSegments[i]->GetZones().size(); ++j) {
+            Zone *zone = mDevices[i]->OpenZone();
+            newSeg->AddZone(zone);
+          }
+          newSeg->RecoverFromOldSegment(mOpenSegments[i]);
+          // reset old segment
+          mOpenSegments[i]->ResetInRecovery();
+        } else {
+          mOpenSegments[i]->RecoverInflightStripes();
+        }
+      } else {
+        printf("NO open segment.\n");
+      }
+    }
+
+    printf("Recover index from sealed segments.\n");
+    // Start recover L2P table and the compact stripe table
+    uint8_t *buffer = (uint8_t*)spdk_zmalloc(
+        std::max(mFooterRegionSize, mDataRegionSize / Configuration::GetSyncGroupSize())
+        * Configuration::GetBlockSize(), 4096,
+        NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+    for (Segment *segment : mSealedSegments) {
+      segment->RecoverIndexFromSealedSegment(buffer, indexMap);
+    }
+    spdk_free(buffer);
+
+    printf("Recover index from open segments.\n");
+    for (Segment *segment : mOpenSegments) {
+      if (segment) {
+        segment->RecoverIndexFromOpenSegment(indexMap);
+      }
+    }
+
+    for (uint32_t i = 0;
+        i < Configuration::GetStorageSpaceInBytes() / Configuration::GetBlockSize();
+        ++i) {
+      if (indexMap[i].second.segment == nullptr) {
+        continue;
+      }
+      mAddressMap[i] = indexMap[i].second;
+      mAddressMap[i].segment->FinishBlock(
+          mAddressMap[i].zoneId,
+          mAddressMap[i].offset,
+          i * Configuration::GetBlockSize() * 1ull);
+    }
+
+    for (Segment *segment : mSealedSegments) {
+      segment->FinishRecovery();
+    }
+
+    for (Segment *segment : mOpenSegments) {
+      if (segment) {
+        segment->FinishRecovery();
+      }
+    }
+    gettimeofday(&e, NULL);
+    double elapsed = e.tv_sec - s.tv_sec + e.tv_usec / 1000000. - s.tv_usec / 1000000.;
+    printf("Recovery time: %.6f\n", elapsed);
   }
 
   if (Configuration::GetEventFrameworkEnabled()) {
@@ -358,19 +458,6 @@ void RAIDController::Init(bool need_env)
     initIoThread();
   }
 
-  // Preallocate segments
-  mNumOpenSegments = Configuration::GetNumOpenSegments();
-
-  mStripeWriteContextPools = new StripeWriteContextPool *[mNumOpenSegments + 2];
-  for (uint32_t i = 0; i < mNumOpenSegments + 2; ++i) {
-    if (Configuration::GetSystemMode() == ZONE_WRITE) {
-      mStripeWriteContextPools[i] = new StripeWriteContextPool(1, mRequestContextPoolForSegments);
-    } else {
-      mStripeWriteContextPools[i] = new StripeWriteContextPool(64, mRequestContextPoolForSegments);
-    }
-  }
-
-  mOpenSegments.resize(mNumOpenSegments);
   for (uint32_t i = 0; i < mNumOpenSegments; ++i) {
     createSegmentIfNeeded(&mOpenSegments[i], i);
   }
@@ -383,11 +470,9 @@ void RAIDController::Init(bool need_env)
 
 RAIDController::~RAIDController()
 {
-  for (auto segment : mSealedSegments) {
-    printf("Zone group: %p\n", segment);
-//    segment->Reset();
-  }
+  Dump();
 
+  delete mAddressMap;
   if (!Configuration::GetEventFrameworkEnabled()) {
     for (uint32_t i = 0; i < Configuration::GetNumIoThreads(); ++i) {
       thread_send_msg(mIoThread[i].thread, quit, nullptr);
@@ -402,14 +487,16 @@ RAIDController::~RAIDController()
 
 void RAIDController::initGc()
 {
+  mGcTask.numBuffers = 32;
   mGcTask.dataBuffer = (uint8_t*)spdk_zmalloc(
-                     8 * Configuration::GetBlockSize(), 4096,
+                     mGcTask.numBuffers * Configuration::GetBlockSize(), 4096,
                      NULL, SPDK_ENV_SOCKET_ID_ANY,
                      SPDK_MALLOC_DMA);
   mGcTask.metaBuffer = (uint8_t*)spdk_zmalloc(
-                     8 * Configuration::GetMetadataSize(),
+                     mGcTask.numBuffers * Configuration::GetMetadataSize(),
                      4096, NULL, SPDK_ENV_SOCKET_ID_ANY,
                      SPDK_MALLOC_DMA);
+  mGcTask.contextPool = new RequestContext[mGcTask.numBuffers];
   mGcTask.stage = IDLE;
 }
 
@@ -417,6 +504,7 @@ uint32_t RAIDController::GcBatchUpdateIndex(
     const std::vector<uint64_t> &lbas,
     const std::vector<std::pair<PhysicalAddr, PhysicalAddr>> &pbas)
 {
+
   uint32_t numSuccessUpdates = 0;
   assert(lbas.size() == pbas.size());
   for (int i = 0; i < lbas.size(); ++i) {
@@ -424,10 +512,10 @@ uint32_t RAIDController::GcBatchUpdateIndex(
     PhysicalAddr oldPba = pbas[i].first;
     PhysicalAddr newPba = pbas[i].second;
 
-    if (mAddressMap->find(lba) == mAddressMap->end()) {
+    if (mAddressMap[lba / Configuration::GetBlockSize()].segment == nullptr) {
       printf("Missing old lba %lu\n", lba);
     }
-    if ((mAddressMap->find(lba))->second == oldPba) {
+    if (mAddressMap[lba / Configuration::GetBlockSize()] == oldPba) {
       numSuccessUpdates += 1;
       UpdateIndex(lba, newPba);
     } else {
@@ -444,13 +532,13 @@ void RAIDController::UpdateIndex(uint64_t lba, PhysicalAddr pba)
     printf("Error\n");
     assert(0);
   }
-  if (mAddressMap->find(lba) != mAddressMap->end()) {
-    PhysicalAddr oldPba = (*mAddressMap)[lba];
+  if (mAddressMap[lba / Configuration::GetBlockSize()].segment != nullptr) {
+    PhysicalAddr oldPba = mAddressMap[lba / Configuration::GetBlockSize()];
     oldPba.segment->InvalidateBlock(oldPba.zoneId, oldPba.offset);
     mNumInvalidBlocks += 1;
   }
   assert(pba.segment != nullptr);
-  (*mAddressMap)[lba] = pba;  
+  mAddressMap[lba / Configuration::GetBlockSize()] = pba;  
   mNumBlocks += 1;
 }
 
@@ -503,6 +591,11 @@ void RAIDController::ReclaimContexts()
       (*it)->Clear();
       mRequestContextPoolForUserRequests->ReturnRequestContext(*it);
       it = mInflightRequestContext.erase(it);
+
+      numSuccessfulReclaims++;
+      if (numSuccessfulReclaims >= 128) {
+        break;
+      }
     } else {
       ++it;
     }
@@ -536,6 +629,9 @@ RequestContext* RAIDController::getContextForUserRequest()
   while (ctx == nullptr) {
     ReclaimContexts();
     ctx = mRequestContextPoolForUserRequests->GetRequestContext(false);
+    if (ctx == nullptr) {
+      printf("NO AVAILABLE CONTEXT FOR USER.\n");
+    }
   }
 
   mInflightRequestContext.insert(ctx);
@@ -576,12 +672,46 @@ void RAIDController::Execute(
   return ;
 }
 
+void RAIDController::EnqueueWrite(RequestContext *ctx)
+{
+  mWriteQueue.push(ctx);
+}
+
+void RAIDController::EnqueueReadPrepare(RequestContext *ctx)
+{
+  mReadPrepareQueue.push(ctx);
+}
+
+void RAIDController::EnqueueReadReaping(RequestContext *ctx)
+{
+  mReadReapingQueue.push(ctx);
+}
+
+std::queue<RequestContext*>& RAIDController::GetWriteQueue()
+{
+  return mWriteQueue;
+}
+
+std::queue<RequestContext*>& RAIDController::GetReadPrepareQueue()
+{
+  return mReadPrepareQueue;
+}
+
+std::queue<RequestContext*>& RAIDController::GetReadReapingQueue()
+{
+  return mReadReapingQueue;
+}
+
 void RAIDController::WriteInDispatchThread(RequestContext *ctx)
 {
   if (mAvailableStorageSpaceInSegments <= 1) {
-    EnqueueEvent(ctx);
     return;
   }
+
+  static uint32_t tick = 0;
+  static uint32_t lastTick = 0;
+  static uint32_t last = 0;
+  static uint32_t stucks = 0;
 
   uint32_t blockSize = Configuration::GetBlockSize();
   uint32_t curOffset = ctx->curOffset;
@@ -589,13 +719,13 @@ void RAIDController::WriteInDispatchThread(RequestContext *ctx)
   uint32_t numBlocks = size / blockSize;
 
   if (curOffset == 0 && ctx->timestamp == ~0ull) {
-    ctx->timestamp = mGlobalTimestamp++;
+    ctx->timestamp = ++mGlobalTimestamp;
     ctx->pbaArray.resize(numBlocks);
   }
 
-  for (uint32_t pos = ctx->curOffset; pos < numBlocks; pos += 1) {
-    uint32_t openGroupId = mNextAppendOpenSegment;
-    mNextAppendOpenSegment = (openGroupId + 1) % mNumOpenSegments;
+  uint32_t pos = ctx->curOffset;
+  for (; pos < numBlocks; pos += 1) {
+    uint32_t openGroupId = 0;
     bool success = false;
 
     for (uint32_t trys = 0; trys < mNumOpenSegments; trys += 1) {
@@ -612,23 +742,20 @@ void RAIDController::WriteInDispatchThread(RequestContext *ctx)
     }
 
     if (!success) {
-      ctx->curOffset = pos;
-      EnqueueEvent(ctx);
-      return;
+      break;
     }
   }
+  ctx->curOffset = pos;
 }
 
 bool RAIDController::LookupIndex(uint64_t lba, PhysicalAddr *pba)
 {
-  auto it = mAddressMap->find(lba);
-  if (it != mAddressMap->end()) {
-    *pba = it->second;
-//      printf("Lookup lba %lu with (*pba) %p %u %u\n", lba, (*pba).segment, (*pba).zoneId, (*pba).offset);
+  
+  if (mAddressMap[lba / Configuration::GetBlockSize()].segment != nullptr) {
+    *pba = mAddressMap[lba / Configuration::GetBlockSize()];
     return true;
   } else {
     pba->segment = nullptr;
-//    printf("Lookup lba %lu with pba not found\n", lba);
     return false;
   }
 }
@@ -641,6 +768,13 @@ void RAIDController::ReadInDispatchThread(RequestContext *ctx)
   uint32_t numBlocks = size / Configuration::GetBlockSize();
 
   if (ctx->status == READ_PREPARE) {
+    if (mGcTask.stage != INDEX_UPDATE_COMPLETE) {
+      // For any reads that may read the input segment,
+      // track its progress such that the GC will
+      // not delete input segment before they finishes
+      mReadsInCurrentGcEpoch.insert(ctx);
+    }
+
     ctx->status = READ_INDEX_QUERYING;
     ctx->pbaArray.resize(numBlocks);
     if (!Configuration::GetEventFrameworkEnabled()) {
@@ -652,9 +786,9 @@ void RAIDController::ReadInDispatchThread(RequestContext *ctx)
       event_call(Configuration::GetIndexThreadCoreId(),
                  queryPba2, this, ctx);
     }
-  } else if (ctx->status == READ_INDEX_READY) {
-    ctx->status = READ_REAPING;
-    for (uint32_t i = ctx->curOffset; i < numBlocks; ++i) {
+  } else if (ctx->status == READ_REAPING) {
+    uint32_t i = ctx->curOffset;
+    for (; i < numBlocks; ++i) {
       Segment *segment = ctx->pbaArray[i].segment;
       if (segment == nullptr) {
         uint8_t *block = (uint8_t *)data + i * Configuration::GetBlockSize();
@@ -665,12 +799,11 @@ void RAIDController::ReadInDispatchThread(RequestContext *ctx)
         }
       } else {
         if (!segment->Read(ctx, i, ctx->pbaArray[i])) {
-          ctx->curOffset = i;
-          EnqueueEvent(ctx);
           break;
         }
       }
     }
+    ctx->curOffset = i;
   }
 }
 
@@ -698,8 +831,6 @@ bool RAIDController::scheduleGc()
   printf("Select: %p, Score: %f, Invalid: %u, Valid: %u\n", mGcTask.inputSegment,
       (double)groups[0]->GetNumInvalidBlocks() / groups[0]->GetNumBlocks(),
       groups[0]->GetNumInvalidBlocks(), groups[0]->GetNumBlocks());
-
-  mSealedSegments.erase(std::find(mSealedSegments.begin(), mSealedSegments.end(), groups[0]));
 
   mGcTask.maxZoneId = mDevices.size();
 
@@ -733,7 +864,9 @@ bool RAIDController::ProceedGc()
     hasProgress |= progressGcReader();
 
     if (mGcTask.curZoneId == mGcTask.maxZoneId) {
-      if (mGcTask.numWriteFinish == mGcTask.numWriteSubmitted) {
+      if (mGcTask.numWriteSubmitted == mGcTask.numReads
+          && mGcTask.numWriteFinish == mGcTask.numWriteSubmitted) {
+        assert(mGcTask.mappings.size() == mGcTask.numWriteFinish);
         mGcTask.stage = REWRITE_COMPLETE;
       }
     }
@@ -742,11 +875,6 @@ bool RAIDController::ProceedGc()
   if (mGcTask.stage == REWRITE_COMPLETE) {
     hasProgress = true;
     mGcTask.stage = INDEX_UPDATING;
-    for (RequestContext *ctx : mInflightRequestContext) {
-      if (ctx->req_type == 'R') {
-        mReadsInCurrentGcEpoch.insert(ctx);
-      }
-    }
 
     if (!Configuration::GetEventFrameworkEnabled()) {
       thread_send_msg(mIndexThread, progressGcIndexUpdate, this);
@@ -756,9 +884,28 @@ bool RAIDController::ProceedGc()
     }
   }
 
-  if (mGcTask.stage == INDEX_UPDATE_COMPLETE && mReadsInCurrentGcEpoch.empty()) {
-    mGcTask.inputSegment->Reset(nullptr);
-    mGcTask.stage = RESETTING_INPUT_SEGMENT;
+  if (mGcTask.stage == INDEX_UPDATING_BATCH) {
+    if (mGcTask.mappings.size() != 0) {
+      hasProgress = true;
+      mGcTask.stage = INDEX_UPDATING;
+      if (!Configuration::GetEventFrameworkEnabled()) {
+        thread_send_msg(mIndexThread, progressGcIndexUpdate, this);
+      } else {
+        event_call(Configuration::GetIndexThreadCoreId(),
+            progressGcIndexUpdate2, this, nullptr);
+      }
+    } else { // Finish updating all mappings
+      hasProgress = true;
+      mGcTask.stage = INDEX_UPDATE_COMPLETE;
+    }
+  }
+
+  if (mGcTask.stage == INDEX_UPDATE_COMPLETE) {
+    if (mReadsInCurrentGcEpoch.empty()) {
+      hasProgress = true;
+      mGcTask.inputSegment->Reset(nullptr);
+      mGcTask.stage = RESETTING_INPUT_SEGMENT;
+    }
   }
 
   if (mGcTask.stage == RESETTING_INPUT_SEGMENT) {
@@ -767,10 +914,11 @@ bool RAIDController::ProceedGc()
       for (uint32_t i = 0; i < zones.size(); ++i) {
         mDevices[i]->ReturnZone(zones[i]);
       }
+      mSealedSegments.erase(mGcTask.inputSegment);
+      delete mGcTask.inputSegment;
       mAvailableStorageSpaceInSegments += 1;
       mGcTask.stage = IDLE;
     }
-    printf("GC Reset finish\n");
   }
 
   return hasProgress;
@@ -789,6 +937,16 @@ void RAIDController::Drain()
   }
 }
 
+std::queue<RequestContext*>& RAIDController::GetEventsToDispatch()
+{
+  return mEventsToDispatch;
+}
+
+void RAIDController::EnqueueEvent(RequestContext *ctx)
+{
+  mEventsToDispatch.push(ctx);
+}
+
 int RAIDController::GetNumInflightRequests()
 {
   return mInflightRequestContext.size();
@@ -802,9 +960,7 @@ bool RAIDController::ExistsGc()
 void RAIDController::createSegmentIfNeeded(Segment **segment, uint32_t spId)
 {
   if (*segment != nullptr) return;
-
   // Check there are available zones
-
   if (mAvailableStorageSpaceInSegments == 0) {
     assert(0);
     printf("No available storage; this should never happen!\n");
@@ -822,10 +978,14 @@ void RAIDController::createSegmentIfNeeded(Segment **segment, uint32_t spId)
     }
     seg->AddZone(zone);
   }
+
+  if (spId == mNumOpenSegments + 1) {
+    printf("Create spare segment %p\n", seg);
+  } else {
+    printf("Create normal segment %p\n", seg);
+  }
   seg->FinalizeCreation();
   *segment = seg;
-
-  printf("Open segment %p\n", *segment);
 }
 
 std::queue<RequestContext*>& RAIDController::GetRequestQueue()
@@ -863,16 +1023,6 @@ struct spdk_thread *RAIDController::GetCompletionThread()
   return mCompletionThread;
 }
 
-std::vector<RequestContext*>& RAIDController::GetEventsToDispatch()
-{
-  return mEventsToDispatch;
-}
-
-void RAIDController::EnqueueEvent(RequestContext *ctx)
-{
-  mEventsToDispatch.emplace_back(ctx);
-}
-
 void RAIDController::initializeGcTask()
 {
   mGcTask.curZoneId = 0;
@@ -884,11 +1034,13 @@ void RAIDController::initializeGcTask()
 
   mGcTask.numWriteSubmitted = 0;
   mGcTask.numWriteFinish = 0;
+  mGcTask.numReads = 0;
 
   mGcTask.mappings.clear();
 
   // Initialize the status of the context pool
-  for (uint32_t i = 0; i < 8; ++i) {
+  for (uint32_t i = 0; i < mGcTask.numBuffers; ++i) {
+    mGcTask.contextPool[i].Clear();
     mGcTask.contextPool[i].available = true;
     mGcTask.contextPool[i].ctrl = this;
     mGcTask.contextPool[i].pbaArray.resize(1);
@@ -909,7 +1061,6 @@ bool RAIDController::progressGcReader()
   // Find contexts that are available, schedule read for valid blocks
   RequestContext *nextReader = &mGcTask.contextPool[mGcTask.readerPos];
   while (nextReader->available && (nextReader->status == WRITE_COMPLETE)) {
-    hasProgress = true;
     if (nextReader->lba != ~0ull) {
       // The sign of valid lba means a successful rewrite a valid block
       // So we update the information here
@@ -941,11 +1092,19 @@ bool RAIDController::progressGcReader()
           mGcTask.curZoneId += 1;
         }
       } while (!valid && mGcTask.curZoneId != mGcTask.maxZoneId);
+      if (valid) {
+        mGcTask.numReads += 1;
+      }
     }
     if (!success) {
+      // will retry later
+      nextReader->status = WRITE_COMPLETE;
+      nextReader->available = true;
+      nextReader->lba = ~0ull;
       break;
     }
-    mGcTask.readerPos = (mGcTask.readerPos + 1) % 8;
+    hasProgress = true;
+    mGcTask.readerPos = (mGcTask.readerPos + 1) % mGcTask.numBuffers;
     nextReader = &mGcTask.contextPool[mGcTask.readerPos];
   }
 
@@ -995,7 +1154,7 @@ bool RAIDController::progressGcWriter()
     mGcTask.mappings[lba] = std::make_pair(oldPba, PhysicalAddr());
     mGcTask.numWriteSubmitted += 1;
 
-    mGcTask.writerPos = (mGcTask.writerPos + 1) % 8;
+    mGcTask.writerPos = (mGcTask.writerPos + 1) % mGcTask.numBuffers;
     nextWriter = &mGcTask.contextPool[mGcTask.writerPos];
 
     hasProgress = true;
@@ -1006,13 +1165,15 @@ bool RAIDController::progressGcWriter()
 bool RAIDController::CheckSegments()
 {
   bool stateChanged = false;
-  for (Segment *segment : mOpenSegments) {
-    if (segment != nullptr) {
-      stateChanged |= segment->StateTransition();
+  for (uint32_t i = 0; i < mOpenSegments.size(); ++i) {
+    if (mOpenSegments[i] != nullptr) {
+      stateChanged |= mOpenSegments[i]->StateTransition();
+      if (mOpenSegments[i]->IsFull()) {
+        mSegmentsToSeal.emplace_back(mOpenSegments[i]);
+        mOpenSegments[i] = nullptr;
+        createSegmentIfNeeded(&mOpenSegments[i], i);
+      }
     }
-  }
-  if (mSpareSegment != nullptr) {
-    stateChanged |= mSpareSegment->StateTransition();
   }
 
   for (auto it = mSegmentsToSeal.begin();
@@ -1021,8 +1182,8 @@ bool RAIDController::CheckSegments()
   {
     stateChanged |= (*it)->StateTransition();
     if ((*it)->GetStatus() == SEGMENT_SEALED) {
-      printf("Sealed, put %p to the sealed segment!\n", (*it));
-      mSealedSegments.push_back(*it);
+      printf("Sealed segment %p.\n", (*it));
+      mSealedSegments.insert(*it);
       it = mSegmentsToSeal.erase(it);
     } else {
       ++it;
@@ -1060,5 +1221,34 @@ void RAIDController::RemoveRequestFromGcEpochIfNecessary(RequestContext *ctx)
 
   if (mReadsInCurrentGcEpoch.find(ctx) != mReadsInCurrentGcEpoch.end()) {
     mReadsInCurrentGcEpoch.erase(ctx);
+  }
+}
+
+void RAIDController::Dump()
+{
+  // Dump address map
+//  for (uint32_t i = 0; i < Configuration::GetStorageSpaceInBytes() / Configuration::GetBlockSize(); ++i) {
+//    if (mAddressMap[i].segment != nullptr) {
+//      printf("%llu %u %u %u\n", 
+//          i * Configuration::GetBlockSize() * 1ull, 
+//          mAddressMap[i].segment->GetSegmentId(),
+//          mAddressMap[i].zoneId,
+//          mAddressMap[i].offset);
+//    }
+//  }
+
+  std::map<uint64_t, Segment*> orderedSegments;
+  // Dump the information of each segment
+  for (auto segment : mOpenSegments) {
+    orderedSegments[segment->GetSegmentId()] = segment;
+  }
+  for (auto segment : mSegmentsToSeal) {
+    orderedSegments[segment->GetSegmentId()] = segment;
+  }
+  for (auto segment : mSealedSegments) {
+    orderedSegments[segment->GetSegmentId()] = segment;
+  }
+  for (auto pr : orderedSegments) {
+    pr.second->Dump();
   }
 }

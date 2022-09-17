@@ -1,4 +1,4 @@
-#include "poller.h"
+#include "messages_and_functions.h"
 #include <vector>
 #include <queue>
 #include "common.h"
@@ -128,19 +128,14 @@ static void handleStripeUnitContext(RequestContext *context)
   switch (status) {
     case WRITE_REAPING:
       if (context->successBytes == context->targetBytes) {
-        if (context->append) {
-          context->segment->UpdateNamedMetadata(context->zoneId,
-              context->stripeId,
-              context->offset);
-        }
         RequestContext *parent = context->associatedRequest;
         if (parent) {
           parent->pbaArray[(context->lba - parent->lba) / Configuration::GetBlockSize()] = context->GetPba();
           parent->successBytes += context->targetBytes;
+          assert(parent->successBytes <= parent->targetBytes);
           if (contextReady(parent)) {
             handleContext(parent);
           }
-          assert(parent->successBytes <= parent->targetBytes);
         }
         context->segment->WriteComplete(context);
         status = WRITE_COMPLETE;
@@ -151,14 +146,8 @@ static void handleStripeUnitContext(RequestContext *context)
     case DEGRADED_READ_REAPING:
       if (context->needDegradedRead) {
         context->needDegradedRead = false;
-        SystemMode mode = Configuration::GetSystemMode();
-        if (mode == ZAPRAID) {
-          status = DEGRADED_READ_META;
-          context->segment->ReadStripeMeta(context);
-        } else {
-          status = DEGRADED_READ_REAPING;
-          context->segment->ReadStripe(context);
-        }
+        status = DEGRADED_READ_REAPING;
+        context->segment->ReadStripe(context);
       } else if (context->successBytes == context->targetBytes) {
         context->segment->ReadComplete(context);
         context->associatedRequest->successBytes += Configuration::GetBlockSize();
@@ -214,33 +203,12 @@ void handleContext(RequestContext *context)
   }
 }
 
-int handleEventsCompletion(void *args)
-{
-  RAIDController *ctrl = (RAIDController*)args;
-  std::queue<RequestContext*>& q = ctrl->GetRequestQueue();
-  std::mutex& qMutex = ctrl->GetRequestQueueMutex();
-  int r = 0;
-
-  qMutex.lock();
-  std::queue<RequestContext *> needCheck;
-  std::swap(needCheck, q);
-  qMutex.unlock();
-
-  while (!needCheck.empty()) {
-    RequestContext *c = needCheck.front();
-    needCheck.pop();
-    handleContext(c);
-  }
-
-  return r > 0 ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
-}
-
-
 void handleEventCompletion2(void *arg1, void *arg2)
 {
   RequestContext *slot = (RequestContext*)arg1;
   handleContext(slot);
 }
+
 void handleEventCompletion(void *args)
 {
   handleEventCompletion2(args, nullptr);
@@ -248,21 +216,48 @@ void handleEventCompletion(void *args)
 
 int handleEventsDispatch(void *args)
 {
+  bool busy = false;
   RAIDController *ctrl = (RAIDController*)args;
-  std::vector<RequestContext*> eventsToDispatch;
-  if (ctrl->GetEventsToDispatch().size() != 0) {
-    std::swap(eventsToDispatch, ctrl->GetEventsToDispatch());
 
-    for (RequestContext *ctx : eventsToDispatch) {
-      if (ctx->req_type == 'W') {
-        ctrl->WriteInDispatchThread(ctx);
-      } else {
-        ctrl->ReadInDispatchThread(ctx);
-      }
+  uint32_t count = 0;
+  std::queue<RequestContext*>& writeQ = ctrl->GetWriteQueue();
+  while (!writeQ.empty()) {
+    RequestContext *ctx = writeQ.front();
+    ctrl->WriteInDispatchThread(ctx);
+
+    if (ctx->curOffset == ctx->size / Configuration::GetBlockSize()) {
+      busy = true;
+      writeQ.pop();
+    } else {
+      break;
     }
   }
 
-  return eventsToDispatch.size() > 0 ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
+  count = 0;
+  std::queue<RequestContext*>& readPrepareQ = ctrl->GetReadPrepareQueue();
+  while (!readPrepareQ.empty()) {
+    RequestContext *ctx = readPrepareQ.front();
+    ctrl->ReadInDispatchThread(ctx);
+    readPrepareQ.pop();
+    busy = true;
+  }
+
+  count = 0;
+  std::queue<RequestContext*>& readReapingQ = ctrl->GetReadReapingQueue();
+  while (!readReapingQ.empty()) {
+    RequestContext *ctx = readReapingQ.front();
+    ctrl->ReadInDispatchThread(ctx);
+
+    uint32_t recordedOffset = ctx->curOffset;
+    if (ctx->curOffset == ctx->size / Configuration::GetBlockSize()) {
+      busy = true;
+      readReapingQ.pop();
+    } else {
+      break;
+    }
+  }
+
+  return busy ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
 }
 
 int handleBackgroundTasks(void *args) {
@@ -279,7 +274,7 @@ int dispatchWorker(void *args)
   RAIDController *raidController = (RAIDController*)args;
   struct spdk_thread *thread = raidController->GetDispatchThread();
   spdk_set_thread(thread);
-  spdk_poller_register(handleEventsDispatch, raidController, 0);
+  spdk_poller_register(handleEventsDispatch, raidController, 1);
   spdk_poller_register(handleBackgroundTasks, raidController, 1);
   while (true) {
     spdk_thread_poll(thread, 0, 0);
@@ -333,7 +328,7 @@ void registerIoCompletionRoutine(void *arg1, void *arg2)
 void registerDispatchRoutine(void *arg1, void *arg2)
 {
   RAIDController *raidController = reinterpret_cast<RAIDController*>(arg1);
-  spdk_poller_register(handleEventsDispatch, raidController, 0);
+  spdk_poller_register(handleEventsDispatch, raidController, 1);
   spdk_poller_register(handleBackgroundTasks, raidController, 1);
 }
 
@@ -341,9 +336,13 @@ void enqueueRequest2(void *arg1, void *arg2)
 {
   RequestContext *ctx = reinterpret_cast<RequestContext*>(arg1);
   if (ctx->req_type == 'W') {
-    ctx->ctrl->WriteInDispatchThread(ctx);
+    ctx->ctrl->EnqueueWrite(ctx);
   } else {
-    ctx->ctrl->ReadInDispatchThread(ctx);
+    if (ctx->status == READ_PREPARE) {
+      ctx->ctrl->EnqueueReadPrepare(ctx);
+    } else if (ctx->status == READ_REAPING) {
+      ctx->ctrl->EnqueueReadReaping(ctx);
+    }
   }
 }
 
@@ -365,7 +364,7 @@ void queryPba2(void *arg1, void *arg2)
       ctx->pbaArray[i].segment = nullptr;
     }
   }
-  ctx->status = READ_INDEX_READY;
+  ctx->status = READ_REAPING;
 
   if (!Configuration::GetEventFrameworkEnabled()) {
     thread_send_msg(ctrl->GetDispatchThread(), enqueueRequest, ctx);
@@ -390,6 +389,7 @@ void zoneWrite2(void *arg1, void *arg2)
   RequestContext *slot = reinterpret_cast<RequestContext*>(arg1);
   auto ioCtx = slot->ioContext;
   slot->stime = timestamp();
+
   int rc = 0;
   if (Configuration::GetDeviceSupportMetadata()) {
     rc = spdk_nvme_ns_cmd_write_with_md(ioCtx.ns, ioCtx.qpair,
@@ -420,6 +420,7 @@ void zoneRead2(void *arg1, void *arg2)
   RequestContext *slot = reinterpret_cast<RequestContext*>(arg1);
   auto ioCtx = slot->ioContext;
   slot->stime = timestamp();
+
   int rc = 0;
   if (Configuration::GetDeviceSupportMetadata()) {
     rc = spdk_nvme_ns_cmd_read_with_md(ioCtx.ns, ioCtx.qpair,
@@ -435,7 +436,7 @@ void zoneRead2(void *arg1, void *arg2)
   }
   if (rc != 0) {
     fprintf(stderr, "Device read error!\n");
-    printf("%d %d %d %s\n", rc, ioCtx.offset, errno, strerror(errno));
+    printf("%d %lu %d %s\n", rc, ioCtx.offset, errno, strerror(errno));
   }
   assert(rc == 0);
 }
@@ -524,16 +525,22 @@ void progressGcIndexUpdate2(void *arg1, void *arg2)
 {
   RAIDController *ctrl = reinterpret_cast<RAIDController*>(arg1);
   GcTask *task = ctrl->GetGcTask();
-  std::vector<uint64_t> lbas; //= new std::vector<uint64_t>();
+  std::vector<uint64_t> lbas;
   std::vector<std::pair<PhysicalAddr, PhysicalAddr>> pbas;
-//    = new std::vector<std::pair<PhysicalAddr, PhysicalAddr>>();
 
-  for (auto it = task->mappings.begin(); it != task->mappings.end(); ++it) {
+  auto it = task->mappings.begin();
+  uint32_t count = 0;
+  while (it != task->mappings.end()) {
     lbas.emplace_back(it->first);
     pbas.emplace_back(it->second);
+
+    it = task->mappings.erase(it);
+
+    count += 1;
+    if (count == 256) break;
   }
   ctrl->GcBatchUpdateIndex(lbas, pbas);
-  task->stage = INDEX_UPDATE_COMPLETE;
+  task->stage = INDEX_UPDATING_BATCH;
 }
 
 void progressGcIndexUpdate(void *args)

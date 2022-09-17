@@ -6,6 +6,7 @@
 #include <mutex>
 #include <vector>
 #include <map>
+#include <unordered_set>
 #include <list>
 #include <spdk/nvme.h>
 #include <spdk/thread.h>
@@ -30,6 +31,8 @@ inline uint64_t round_down(uint64_t value, uint64_t align)
 
 typedef void (*zns_raid_request_complete)(void *cb_arg);
 
+void completeOneEvent(void *arg, const struct spdk_nvme_cpl *completion);
+void complete(void *arg, const struct spdk_nvme_cpl *completion);
 void thread_send_msg(spdk_thread *thread, spdk_msg_fn fn, void *args);
 void event_call(uint32_t core_id, spdk_event_fn fn, void *arg1, void *arg2);
 
@@ -69,7 +72,6 @@ enum ContextStatus {
   WRITE_COMPLETE,
   READ_PREPARE,
   READ_INDEX_QUERYING,
-  READ_INDEX_READY,
   READ_REAPING,
   READ_COMPLETE,
   DEGRADED_READ_REAPING,
@@ -112,7 +114,7 @@ struct ProtectedBlockMetadata {
 };
 
 struct NonProtectedBlockMetadata {
-  uint8_t stripeId;
+  uint32_t stripeId;
 };
 
 union BlockMetadata {
@@ -193,7 +195,7 @@ struct RequestContext
 };
 
 // Data is an array: index is offset, value is the stripe Id in the corresponding group
-struct NamedMetadata {
+struct GroupMeta {
   uint8_t *data;
   uint8_t *metadata;
   RequestContext slots[16];
@@ -205,6 +207,7 @@ enum GcTaskStage {
   REWRITING,
   REWRITE_COMPLETE,
   INDEX_UPDATING,
+  INDEX_UPDATING_BATCH,
   INDEX_UPDATE_COMPLETE,
   RESETTING_INPUT_SEGMENT,
   COMPLETE
@@ -222,14 +225,16 @@ struct GcTask {
   uint8_t* metaBuffer;
   uint32_t writerPos;
   uint32_t readerPos;
-  RequestContext contextPool[8];
-  PhysicalAddr blockAddr[8];
+  RequestContext *contextPool;
 
   uint32_t numWriteSubmitted;
   uint32_t numWriteFinish;
+  uint32_t numReads;
 
   uint32_t curZoneId;
   uint32_t nextOffset;
+
+  uint32_t numBuffers;
 
   std::map<uint64_t, std::pair<PhysicalAddr, PhysicalAddr>> mappings;
 };
@@ -254,7 +259,6 @@ struct RequestContextPool {
 struct ReadContextPool {
   ReadContext *contexts;
   std::vector<ReadContext*> availableContexts;
-  std::list<ReadContext*> inflightContexts;
   RequestContextPool *requestPool;
   uint32_t capacity;
 
@@ -270,7 +274,7 @@ struct StripeWriteContextPool {
   uint32_t capacity;
   struct StripeWriteContext *contexts;
   std::vector<StripeWriteContext *> availableContexts;
-  std::list<StripeWriteContext *> inflightContexts;
+  std::unordered_set<StripeWriteContext *> inflightContexts;
   struct RequestContextPool *rPool;
 
   StripeWriteContextPool(uint32_t cap, struct RequestContextPool *rp);

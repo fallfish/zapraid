@@ -22,5 +22,6 @@ void zns_raid_set_num_open_segments(uint32_t num_open_segments);
 void zns_raid_set_header_footer(uint32_t enable_header_footer);
 
 void zns_raid_set_storage_space_in_bytes(uint64_t storage_space_in_bytes);
+void zns_raid_set_enable_event_framework(bool enable);
 
 #endif

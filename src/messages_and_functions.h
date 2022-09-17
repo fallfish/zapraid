@@ -1,5 +1,5 @@
-#ifndef __POLLER_H__
-#define __POLLER_H__
+#ifndef __MESSAGES_AND_FUNCTIONS_H__
+#define __MESSAGES_AND_FUNCTIONS_H__
 
 #include "common.h"
 
