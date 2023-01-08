@@ -12,14 +12,16 @@ struct spdk_nvme_ns *g_ns = nullptr;
 struct spdk_nvme_qpair* g_qpair = nullptr;
 uint8_t *g_data = nullptr;
 uint32_t g_num_issued = 0, g_num_completed = 0;
-uint32_t g_lba = 0;
-uint32_t g_zone_size = 2 * 1024 * 1024 / 4;
-uint32_t g_zone_capacity = 1077 * 1024 / 4;
+uint64_t g_zone_size = 2 * 1024 * 1024 / 4;
+uint64_t g_zone_capacity = 1077 * 1024 / 4;
 uint32_t g_mode = 0;
 uint32_t g_num_concurrent_writes = 1;
+uint32_t g_num_open_zones = 1;
 uint32_t g_req_size = 1;
+uint64_t g_lba_pointers[32];
+uint64_t g_next_zone_start = 0;
 
-void write_block(uint64_t lba);
+void write_block(uint64_t *lba);
 
 static uint64_t round_up(uint64_t a, uint64_t b)
 {
@@ -42,7 +44,7 @@ static auto attach_cb = [](void *cb_ctx,
     struct spdk_nvme_ctrlr *ctrlr,
     const struct spdk_nvme_ctrlr_opts *opts) -> void {
 
-  if (g_ctrlr == nullptr) {
+  if (strcmp(trid->traddr, "0000:12:00.0") == 0 && g_ctrlr == nullptr) {
     g_ctrlr = ctrlr;
     g_ns = spdk_nvme_ctrlr_get_ns(ctrlr, 1);
 
@@ -53,18 +55,17 @@ static auto attach_cb = [](void *cb_ctx,
 };
 
 void complete(void *arg, const struct spdk_nvme_cpl *completion) {
-  gettimeofday(&t_time_e, NULL);
-  double elapsed = t_time_e.tv_sec - t_time_s.tv_sec 
-    + t_time_e.tv_usec / 1000000. - t_time_s.tv_usec / 1000000.;
+  uint64_t *lba = (uint64_t*)arg;
 
   g_num_completed += g_req_size;
 
   if (g_num_issued < dataset_size) {
-    write_block(g_lba);
-    g_lba += g_req_size;
-    if (g_lba % g_zone_size == g_zone_capacity) {
-      g_lba = round_up(g_lba, g_zone_size);
+    *lba += g_req_size;
+    if (*lba % g_zone_size == g_zone_capacity) {
+      *lba = g_next_zone_start;
+      g_next_zone_start += g_zone_size;
     }
+    write_block(lba);
   }
 
   if (spdk_nvme_cpl_is_error(completion)) {
@@ -74,23 +75,23 @@ void complete(void *arg, const struct spdk_nvme_cpl *completion) {
   }
 };
 
-void write_block(uint64_t lba)
+void write_block(uint64_t *lba)
 {
   g_num_issued += g_req_size;
   if (g_mode == 0) {
     int rc = spdk_nvme_ns_cmd_write(
         g_ns, g_qpair,
-        g_data, lba, g_req_size,
-        complete, nullptr, 0);
+        g_data, *lba, g_req_size,
+        complete, lba, 0);
     if (rc < 0) {
       printf("write error.");
     }
   } else {
-    uint64_t zslba = round_down(lba, g_zone_size);
+    uint64_t zslba = round_down(*lba, g_zone_size);
     int rc = spdk_nvme_zns_zone_append(
         g_ns, g_qpair,
         g_data, zslba, g_req_size, 
-        complete, nullptr, 0);
+        complete, lba, 0);
     if (rc < 0) {
       printf("append error.");
     }
@@ -100,13 +101,16 @@ void write_block(uint64_t lba)
 int main(int argc, char *argv[])
 {
   int opt;
-  while ((opt = getopt(argc, argv, "m:c:s:h:")) != -1) {  // for each option...
+  while ((opt = getopt(argc, argv, "m:c:z:s:h:")) != -1) {  // for each option...
     switch (opt) {
       case 'm':
         g_mode = atoi(optarg);
         break;
       case 'c':
         g_num_concurrent_writes = atoi(optarg);
+        break;
+      case 'z':
+        g_num_open_zones = atoi(optarg);
         break;
       case 's':
         g_req_size = atoi(optarg);
@@ -116,6 +120,7 @@ int main(int argc, char *argv[])
         printf(
             "-m: write primitive, 0 - use zone write, 1 - use zone append\n"
             "-c: number of concurrent write requests\n"
+            "-z: number of open zones\n"
             "-s: request size\n");
         return 0;
     }
@@ -145,7 +150,10 @@ int main(int argc, char *argv[])
     printf("Reset zone failed.\n");
   }
 
-  printf("Mode: %d, Concurrent writes: %d, Request size: %d\n", g_mode, g_num_concurrent_writes, g_req_size);
+  printf("Mode: %d, Concurrent writes: %d, Open zones: %d, Request size: %d\n", g_mode, g_num_concurrent_writes, g_num_open_zones, g_req_size);
+  if (g_mode == 0) {
+    assert(g_num_concurrent_writes == 1);
+  }
   while (!done) {
     spdk_nvme_qpair_process_completions(g_qpair, 0);
   }
@@ -159,10 +167,13 @@ int main(int argc, char *argv[])
   gettimeofday(&g_time_s, NULL);
 
   // initialize
-  for (uint32_t i = 0; i < g_num_concurrent_writes; ++i) {
-     write_block(i);
+  g_next_zone_start = g_num_open_zones * g_zone_size;
+  for (uint32_t i = 0; i < g_num_open_zones; ++i) {
+    for (uint32_t j = 0; j < g_num_concurrent_writes; ++j) {
+      g_lba_pointers[i] = i * g_zone_size + j * g_req_size;
+      write_block(&g_lba_pointers[i]);
+    }
   }
-  g_lba = g_num_concurrent_writes * g_req_size;
 
   while (g_num_completed < dataset_size) { // 64GiB / 4KiB
     // report the performance and exit the program

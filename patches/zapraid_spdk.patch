@@ -1,0 +1,293 @@
+diff --git a/CONFIG b/CONFIG
+index 31bd87a91..bd16bda2b 100644
+--- a/CONFIG
++++ b/CONFIG
+@@ -188,3 +188,6 @@ CONFIG_IPSEC_MB_DIR=
+ 
+ # Generate Storage Management Agent's protobuf interface
+ CONFIG_SMA=n
++
++CONFIG_ZAPRAID=n
++CONFIG_ZAPRAID_SOURCE_DIR=dummy_path
+diff --git a/configure b/configure
+index cf47baa87..0ccb3b099 100755
+--- a/configure
++++ b/configure
+@@ -654,6 +654,18 @@ for i in "$@"; do
+ 		--without-sma)
+ 			CONFIG[SMA]=n
+ 			;;
++                --with-zapraid) ;&
++                --with-zapraid=*)
++                        if [[ ${i#*=} != "$i" ]]; then
++                          CONFIG[ZAPRAID_SOURCE_DIR]=${i#*=}
++                        fi
++                        check_dir "--with-fio=${CONFIG[ZAPRAID_SOURCE_DIR]}"
++                        CONFIG[ZAPRAID_SOURCE_DIR]=$(readlink -f "${CONFIG[ZAPRAID_SOURCE_DIR]}")
++                        CONFIG[ZAPRAID]=y
++                        ;;
++                --without-zapraid)
++                        CONFIG[ZAPRAID]=n
++                        ;;
+ 		--)
+ 			break
+ 			;;
+diff --git a/examples/bdev/fio_plugin/fio_plugin.c b/examples/bdev/fio_plugin/fio_plugin.c
+index ee53146fd..dbe0665d7 100644
+--- a/examples/bdev/fio_plugin/fio_plugin.c
++++ b/examples/bdev/fio_plugin/fio_plugin.c
+@@ -129,20 +129,23 @@ spdk_fio_init_thread(struct thread_data *td)
+ 	struct spdk_fio_thread *fio_thread;
+ 	struct spdk_thread *thread;
+ 
+-	g_internal_thread = true;
+-	thread = spdk_thread_create("fio_thread", NULL);
+-	g_internal_thread = false;
+-	if (!thread) {
+-		SPDK_ERRLOG("failed to allocate thread\n");
+-		return -1;
++        fio_thread = calloc(1, sizeof(*fio_thread));
++
++        if (!fio_thread) {
++          SPDK_ERRLOG("failed to allocate thread local context\n");
++          return -1;
+ 	}
+ 
+-	fio_thread = spdk_thread_get_ctx(thread);
+ 	fio_thread->td = td;
+-	fio_thread->thread = thread;
+ 	td->io_ops_data = fio_thread;
+ 
+-	spdk_set_thread(thread);
++        fio_thread->thread = spdk_thread_create("fio_thread", NULL);
++        if (!fio_thread->thread) {
++          free(fio_thread);
++          SPDK_ERRLOG("failed to allocate thread\n");
++          return -1;
++        }
++        spdk_set_thread(fio_thread->thread);
+ 
+ 	fio_thread->iocq_size = td->o.iodepth;
+ 	fio_thread->iocq = calloc(fio_thread->iocq_size, sizeof(struct io_u *));
+@@ -234,6 +237,7 @@ spdk_fio_bdev_fini_start(void *arg)
+ static void *
+ spdk_init_thread_poll(void *arg)
+ {
++
+ 	struct spdk_fio_options		*eo = arg;
+ 	struct spdk_fio_thread		*fio_thread;
+ 	struct spdk_fio_thread		*thread, *tmp;
+@@ -266,6 +270,7 @@ spdk_init_thread_poll(void *arg)
+ 
+ 	/* Initialize the environment library */
+ 	spdk_env_opts_init(&opts);
++        opts.core_mask = "0xfff";
+ 	opts.name = "fio";
+ 
+ 	if (eo->mem_mb) {
+@@ -298,7 +303,9 @@ spdk_init_thread_poll(void *arg)
+ #endif
+ 	}
+ 
+-	spdk_thread_lib_init(spdk_fio_schedule_thread, sizeof(struct spdk_fio_thread));
++//        spdk_thread_lib_init_ext(NULL, NULL, 0, 4 * 1024 * 1024 - 1);
++        spdk_thread_lib_init(NULL, 0);
++//	spdk_thread_lib_init(spdk_fio_schedule_thread, sizeof(struct spdk_fio_thread));
+ 
+ 	/* Create an SPDK thread temporarily */
+ 	rc = spdk_fio_init_thread(&td);
+@@ -337,8 +344,9 @@ spdk_init_thread_poll(void *arg)
+ 			TAILQ_FOREACH_SAFE(thread, &g_threads, link, tmp) {
+ 				if (spdk_thread_is_exited(thread->thread)) {
+ 					TAILQ_REMOVE(&g_threads, thread, link);
+-					free(thread->iocq);
+ 					spdk_thread_destroy(thread->thread);
++					free(thread->iocq);
++                                        free(thread);
+ 				} else {
+ 					spdk_fio_poll_thread(thread);
+ 				}
+@@ -369,6 +377,7 @@ spdk_init_thread_poll(void *arg)
+ 	done = false;
+ 	spdk_thread_send_msg(fio_thread->thread, spdk_fio_bdev_fini_start, &done);
+ 
++        printf("Cleanup begin.\n");
+ 	do {
+ 		spdk_fio_poll_thread(fio_thread);
+ 
+@@ -377,6 +386,8 @@ spdk_init_thread_poll(void *arg)
+ 		}
+ 	} while (!done);
+ 
++        printf("Cleanup done 0.\n");
++
+ 	/* Now exit all the threads */
+ 	TAILQ_FOREACH(thread, &g_threads, link) {
+ 		spdk_set_thread(thread->thread);
+@@ -384,19 +395,23 @@ spdk_init_thread_poll(void *arg)
+ 		spdk_set_thread(NULL);
+ 	}
+ 
++        printf("Cleanup done 1.\n");
++
+ 	/* And wait for them to gracefully exit */
+ 	while (!TAILQ_EMPTY(&g_threads)) {
+ 		TAILQ_FOREACH_SAFE(thread, &g_threads, link, tmp) {
+ 			if (spdk_thread_is_exited(thread->thread)) {
+ 				TAILQ_REMOVE(&g_threads, thread, link);
+-				free(thread->iocq);
+ 				spdk_thread_destroy(thread->thread);
++				free(thread->iocq);
++                                free(thread);
+ 			} else {
+ 				spdk_thread_poll(thread->thread, 0, 0);
+ 			}
+ 		}
+ 	}
+ 
++        printf("Cleanup done.\n");
+ 	pthread_exit(NULL);
+ 
+ err_exit:
+diff --git a/lib/nvmf/ctrlr.c b/lib/nvmf/ctrlr.c
+index 296ce195e..a9a836f7d 100644
+--- a/lib/nvmf/ctrlr.c
++++ b/lib/nvmf/ctrlr.c
+@@ -361,7 +361,7 @@ nvmf_ctrlr_create(struct spdk_nvmf_subsystem *subsystem,
+ 	if (ctrlr->subsys->flags.ana_reporting) {
+ 		ctrlr->feat.async_event_configuration.bits.ana_change_notice = 1;
+ 	}
+-	ctrlr->feat.volatile_write_cache.bits.wce = 1;
++	ctrlr->feat.volatile_write_cache.bits.wce = 0; // disable the write cache; in our zapraid case, there is no volatile cache.
+ 	/* Coalescing Disable */
+ 	ctrlr->feat.interrupt_vector_configuration.bits.cd = 1;
+ 
+@@ -2680,7 +2680,7 @@ spdk_nvmf_ctrlr_identify_ctrlr(struct spdk_nvmf_ctrlr *ctrlr, struct spdk_nvme_c
+ 		cdata->cqes.min = 4;
+ 		cdata->cqes.max = 4;
+ 		cdata->nn = subsystem->max_nsid;
+-		cdata->vwc.present = 1;
++		cdata->vwc.present = 0;  // vwc not present for zapraid
+ 		cdata->vwc.flush_broadcast = SPDK_NVME_FLUSH_BROADCAST_NOT_SUPPORTED;
+ 
+ 		cdata->nvmf_specific = ctrlr->cdata.nvmf_specific;
+diff --git a/mk/spdk.app.mk b/mk/spdk.app.mk
+index 424fac1ab..f6104faac 100644
+--- a/mk/spdk.app.mk
++++ b/mk/spdk.app.mk
+@@ -22,6 +22,10 @@ APP := $(APP)$(EXEEXT)
+ 
+ LIBS += $(SPDK_LIB_LINKER_ARGS)
+ 
++ifeq ($(CONFIG_ZAPRAID),y)
++  LIBS += -lzapraid
++endif
++
+ CLEAN_FILES = $(APP)
+ 
+ all : $(APP)
+@@ -36,7 +40,7 @@ empty_rule:
+ 	@:
+ 
+ $(APP) : $(OBJS) $(SPDK_LIB_FILES) $(ENV_LIBS)
+-	$(LINK_C)
++	$(LINK_C) -lstdc++
+ 
+ clean :
+ 	$(CLEAN_C) $(CLEAN_FILES)
+diff --git a/mk/spdk.common.mk b/mk/spdk.common.mk
+index cc02de1e5..a659a1a89 100644
+--- a/mk/spdk.common.mk
++++ b/mk/spdk.common.mk
+@@ -161,6 +161,13 @@ LDFLAGS += -L$(CONFIG_URING_PATH)
+ endif
+ endif
+ 
++# ZNS_RAID
++ifeq ($(CONFIG_ZAPRAID),y)
++  CFLAGS += -I$(CONFIG_ZAPRAID_SOURCE_DIR)/src
++  LDFLAGS += -L$(CONFIG_ZAPRAID_SOURCE_DIR)/build/src
++  SYS_LIBS += -lzapraid
++endif
++
+ IPSEC_MB_DIR=$(CONFIG_IPSEC_MB_DIR)
+ 
+ ISAL_DIR=$(SPDK_ROOT_DIR)/isa-l
+diff --git a/mk/spdk.fio.mk b/mk/spdk.fio.mk
+index f1a738407..63981baa0 100644
+--- a/mk/spdk.fio.mk
++++ b/mk/spdk.fio.mk
+@@ -44,8 +44,13 @@ uninstall: empty_rule
+ empty_rule:
+ 	@:
+ 
++ZAPRAID_FLAGS = 
++ifeq ($(CONFIG_ZAPRAID),y)
++  ZAPRAID_FLAGS += -lzapraid -lisal -lstdc++ -g
++endif
++
+ $(FIO_PLUGIN) : $(OBJS) $(SPDK_LIB_FILES) $(ENV_LIBS)
+-	$(LINK_C)
++	$(LINK_C) $(ZAPRAID_FLAGS)
+ 
+ clean :
+ 	$(CLEAN_C) $(CLEAN_FILES)
+diff --git a/mk/spdk.lib_deps.mk b/mk/spdk.lib_deps.mk
+index faaf0cebb..1e0fd3b2a 100644
+--- a/mk/spdk.lib_deps.mk
++++ b/mk/spdk.lib_deps.mk
+@@ -132,6 +132,7 @@ DEPDIRS-bdev_rbd := $(BDEV_DEPS_THREAD)
+ DEPDIRS-bdev_uring := $(BDEV_DEPS_THREAD)
+ DEPDIRS-bdev_virtio := $(BDEV_DEPS_THREAD) virtio
+ DEPDIRS-bdev_zone_block := $(BDEV_DEPS_THREAD)
++DEPDIRS-bdev_zns_raid := $(BDEV_DEPS_THREAD)
+ 
+ # module/event
+ 
+diff --git a/mk/spdk.modules.mk b/mk/spdk.modules.mk
+index a5ee0ece2..28ac698de 100644
+--- a/mk/spdk.modules.mk
++++ b/mk/spdk.modules.mk
+@@ -74,6 +74,7 @@ BLOCKDEV_MODULES_PRIVATE_LIBS += -L$(CONFIG_URING_PATH)
+ endif
+ endif
+ 
++
+ ifeq ($(CONFIG_RBD),y)
+ BLOCKDEV_MODULES_LIST += bdev_rbd
+ BLOCKDEV_MODULES_PRIVATE_LIBS += -lrados -lrbd
+@@ -84,6 +85,12 @@ BLOCKDEV_MODULES_LIST += bdev_pmem
+ BLOCKDEV_MODULES_PRIVATE_LIBS += -lpmemblk -lpmem
+ endif
+ 
++ifeq ($(CONFIG_ZAPRAID),y)
++  CFLAGS += -I$(CONFIG_ZAPRAID_SOURCE_DIR)/src
++  BLOCKDEV_MODULES_LIST += bdev_zns_raid
++  BLOCKDEV_MODULES_PRIVATE_LIBS += -L$(CONFIG_ZAPRAID_SOURCE_DIR)/build/src -lzapraid
++endif
++
+ SOCK_MODULES_LIST = sock_posix
+ 
+ ifeq ($(OS), Linux)
+diff --git a/module/bdev/Makefile b/module/bdev/Makefile
+index 9481b5419..1ab438091 100644
+--- a/module/bdev/Makefile
++++ b/module/bdev/Makefile
+@@ -6,7 +6,7 @@
+ SPDK_ROOT_DIR := $(abspath $(CURDIR)/../..)
+ include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
+ 
+-DIRS-y += delay error gpt lvol malloc null nvme passthru raid split zone_block
++DIRS-y += delay error gpt lvol malloc null nvme passthru raid split zone_block 
+ 
+ DIRS-$(CONFIG_XNVME) += xnvme
+ 
+@@ -18,6 +18,8 @@ DIRS-$(CONFIG_REDUCE) += compress
+ 
+ DIRS-$(CONFIG_URING) += uring
+ 
++DIRS-$(CONFIG_ZAPRAID) += zns_raid 
++
+ ifeq ($(OS),Linux)
+ DIRS-y += aio
+ DIRS-$(CONFIG_ISCSI_INITIATOR) += iscsi

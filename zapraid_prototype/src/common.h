@@ -108,26 +108,26 @@ struct ReadContext {
   std::vector<RequestContext*> ioContext;
 };
 
-struct ProtectedBlockMetadata {
+struct CodedBlockMetadata {
   uint64_t lba;
   uint64_t timestamp;
 };
 
-struct NonProtectedBlockMetadata {
+struct ReplicatedBlockMetadata {
   uint32_t stripeId;
 };
 
 union BlockMetadata {
   struct {
-    struct ProtectedBlockMetadata protectedField;
-    struct NonProtectedBlockMetadata nonProtectedField;
+    struct CodedBlockMetadata coded;
+    struct ReplicatedBlockMetadata replicated;
   } fields;
   uint8_t reserved[64];
 };
 
 struct RequestContext
 {
-  // Each Context is pre-allocated with a buffer
+  // The buffers are pre-allocated
   uint8_t *dataBuffer;
   uint8_t *metadataBuffer;
   ContextType type;
@@ -286,7 +286,14 @@ private:
   bool checkStripeAvailable(StripeWriteContext *stripe);
 };
 
+double GetTimestampInUs();
 double timestamp();
 double gettimediff(struct timeval s, struct timeval e);
+
+void InitErasureCoding();
+void DecodeStripe(uint32_t offset, uint8_t **stripe,
+    bool *alive, uint32_t n, uint32_t k,
+    uint32_t decodeZid, uint32_t unitSize);
+void EncodeStripe(uint8_t **stripe, uint32_t n, uint32_t k, uint32_t unitSize);
 
 #endif

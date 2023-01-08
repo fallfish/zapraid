@@ -23,8 +23,8 @@ struct SegmentMetadata {
 
 enum SegmentStatus {
   SEGMENT_NORMAL,
-  SEGMENT_PREPARE_STRIPE_META,
-  SEGMENT_WRITING_STRIPE_META,
+  SEGMENT_CONCLUDING_WRITES_IN_GROUP,
+  SEGMENT_CONCLUDING_APPENDS_IN_GROUP,
   SEGMENT_WRITING_HEADER,
   SEGMENT_PREPARE_FOOTER,
   SEGMENT_WRITING_FOOTER,
@@ -133,8 +133,6 @@ public:
   void WriteComplete(RequestContext *ctx);
   void ReadComplete(RequestContext *ctx);
 
-  void UpdateGroupMeta(uint32_t zoneId, uint32_t assignedOffset, uint32_t realOffset);
-
   void InvalidateBlock(uint32_t zoneId, uint32_t realOffset);
   void FinishBlock(uint32_t zoneId, uint32_t realOffset, uint64_t lba);
   void PrintStats();
@@ -142,16 +140,13 @@ public:
 
   void ReclaimReadContext(ReadContext *context);
 
+  void FlushCurrentStripe();
   bool StateTransition();
   SegmentStatus GetStatus();
   void ReleaseZones();
-  void FlushStripe();
 
   void GenerateParityBlock(StripeWriteContext *stripe, uint32_t zonePos);
   void ProgressFooterWriter();
-
-  void IssueGroupMeta();
-  bool NeedGroupMeta();
 
   uint32_t GetPos();
 
@@ -164,7 +159,7 @@ public:
   bool RecoverFooterRegionIfNeeded();
   bool RecoverNeedRewrite();
   void RecoverFromOldSegment(Segment *segment);
-  void RecoverInflightStripes();
+  void RecoverState();
 
   void RecoverIndexFromSealedSegment(uint8_t *buffer, std::pair<uint64_t, PhysicalAddr> *indexMap);
   void RecoverIndexFromOpenSegment(std::pair<uint64_t, PhysicalAddr> *indexMap);
@@ -193,13 +188,11 @@ private:
   void encodeStripe(uint8_t **stripe, uint32_t n, uint32_t k, uint32_t unitSize);
   void decodeStripe(uint32_t offset, uint8_t **stripe, bool *alive, uint32_t n, uint32_t k, uint32_t decodeIndex);
 
-  bool hasGroupMetaDone();
-
   void fillInFooterBlock(uint8_t **data, uint32_t pos);
   
   bool* mValidBits;
   uint8_t* mCompactStripeTable;
-  ProtectedBlockMetadata *mProtectedBlockMetadata;
+  CodedBlockMetadata *mCodedBlockMetadata;
 
   std::vector<Zone*> mZones;
   std::vector<RequestContext> mResetContext;
@@ -224,17 +217,16 @@ private:
   SegmentMetadata mSegmentMeta;
   SegmentStatus mSegmentStatus;
 
-  GroupMeta mCurrentGroupMeta;
-
   RAIDController *mRaidController;
 
   StripeWriteContext *mAdminStripe;
 
   // for recovery
-  uint8_t *mDataBufferForRecovery;
-  uint8_t *mMetadataBufferForRecovery;
+  uint8_t *mDataBufferForRecovery[16];
+  uint8_t *mMetadataBufferForRecovery[16];
   std::map<uint32_t, std::vector<uint64_t>> mStripesToRecover;
   std::vector<std::pair<uint64_t, uint8_t*>> mZonesWpForRecovery;
+  double mLastStripeCreationTimestamp = 0;
 };
 
 #endif

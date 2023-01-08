@@ -132,6 +132,583 @@ void RAIDController::initIoThread()
   }
 }
 
+void RAIDController::rebuild(uint32_t failedDriveId)
+{
+  struct timeval s, e;
+  gettimeofday(&s, NULL);
+
+  // Valid (full and open) zones and their headers
+  std::map<uint64_t, uint8_t*> zonesAndHeaders[mDevices.size()];
+  // Segment ID to (wp, SegmentMetadata)
+  std::map<uint32_t, std::vector<std::pair<uint64_t, uint8_t*>>> potentialSegments;
+  for (uint32_t i = 0; i < mDevices.size(); ++i) {
+    if (i == failedDriveId) {
+      continue;
+    }
+
+    mDevices[i]->ReadZoneHeaders(zonesAndHeaders[i]);
+    for (auto zoneAndHeader : zonesAndHeaders[i]) {
+      uint64_t wp = zoneAndHeader.first;
+      SegmentMetadata *segMeta = reinterpret_cast<SegmentMetadata*>(zoneAndHeader.second);
+      if (potentialSegments.find(segMeta->segmentId) == potentialSegments.end()) {
+        potentialSegments[segMeta->segmentId].resize(mDevices.size());
+      }
+      potentialSegments[segMeta->segmentId][i] = std::pair(wp, zoneAndHeader.second);
+    }
+  }
+
+  // Filter out invalid segments
+  for (auto it = potentialSegments.begin();
+       it != potentialSegments.end(); ) {
+    auto &zones = it->second;
+    bool isValid = true;
+
+    SegmentMetadata *segMeta = nullptr;
+    for (uint32_t i = 0; i < mDevices.size(); ++i) {
+      if (i == failedDriveId) {
+        continue;
+      }
+
+      auto zone = zones[i];
+      if (zone.second == nullptr) {
+        isValid = false;
+        break;
+      }
+
+      if (segMeta == nullptr) {
+        segMeta = reinterpret_cast<SegmentMetadata*>(zone.second);
+      }
+
+      if (memcmp(segMeta, zone.second, sizeof(SegmentMetadata)) != 0) {
+        isValid = false;
+        break;
+      }
+    }
+
+    if (!isValid) {
+      it = potentialSegments.erase(it);
+    } else {
+      ++it;
+    }
+  }
+
+  uint32_t numZones = mDevices.size();
+  uint32_t zoneSize = 2 * 1024 * 1024 / 4;
+  uint32_t blockSize = Configuration::GetBlockSize();
+  uint32_t metadataSize = Configuration::GetMetadataSize();
+  // repair; allocate buffer in advance (read the whole zone from other drives)
+  uint8_t *buffers[numZones];
+  uint8_t *metaBufs[numZones];
+  for (uint32_t i = 0; i < numZones; ++i) {
+    buffers[i] = (uint8_t*)spdk_zmalloc(zoneSize * blockSize, 4096, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+    metaBufs[i] = (uint8_t*)spdk_zmalloc(
+      zoneSize * metadataSize, 4096, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+    assert(buffers[i] != nullptr);
+    assert(metaBufs[i] != nullptr);
+  }
+
+  bool alive[numZones];
+  for (uint32_t zoneId = 0; zoneId < numZones; ++zoneId) {
+    if (zoneId == failedDriveId) {
+      alive[zoneId] = false;
+    } else {
+      alive[zoneId] = true;
+    }
+  }
+
+  uint32_t groupSize = Configuration::GetStripeGroupSize();
+  uint32_t numStripeGroups = mDataRegionSize / groupSize;
+  std::vector< std::vector<uint32_t> > stripeIdx2Offsets;
+  stripeIdx2Offsets.resize(groupSize);
+  for (uint32_t i = 0; i < groupSize; ++i) {
+    stripeIdx2Offsets[i].resize(numZones);
+  }
+
+  for (auto it = potentialSegments.begin(); it != potentialSegments.end(); ++it) {
+    auto &zones = it->second;
+    // read the zones from other devices
+    uint32_t offsets[numZones];
+    for (uint32_t i = 0; i < numZones; ++i) {
+      offsets[i] = 0;
+    }
+    while (true) {
+      uint32_t counter = 0;
+      for (uint32_t i = 0; i < numZones; ++i) {
+        if (i == failedDriveId) {
+          continue;
+        }
+        auto zone = zones[i];
+        uint64_t wp = zone.first;
+        uint32_t wpInZone = wp % zoneSize;
+        uint64_t zslba = wp - wpInZone;
+        uint32_t numBlocks2Fetch = std::min(wpInZone - offsets[i], 256u);
+
+        if (numBlocks2Fetch > 0) {
+          // update compact stripe table
+          int error = 0;
+          if ((error = spdk_nvme_ns_cmd_read_with_md(mDevices[i]->GetNamespace(),
+                  mDevices[i]->GetIoQueue(0),
+                  buffers[i] + offsets[i] * blockSize, metaBufs[i] + offsets[i] * metadataSize,
+                  zslba + offsets[i], numBlocks2Fetch,
+                  completeOneEvent, &counter, 0, 0, 0)) < 0) {
+            printf("Error in reading %d %s.\n", error, strerror(error));
+          }
+          offsets[i] += numBlocks2Fetch;
+          counter += 1;
+        }
+      }
+
+      if (counter == 0) {
+        break;
+      }
+
+      while (counter != 0) {
+        for (uint32_t i = 0; i < numZones; ++i) {
+          if (i == failedDriveId) continue;
+          spdk_nvme_qpair_process_completions(mDevices[i]->GetIoQueue(0), 0);
+        }
+      }
+    }
+
+    bool concluded = true;
+    uint64_t validEnd = 0;
+    // rebuild in memory
+    if (Configuration::GetSystemMode() == ZAPRAID) {
+      uint32_t stripeGroupId = 0;
+      for (uint32_t stripeGroupIdx = 0; stripeGroupIdx < numStripeGroups; ++stripeGroupIdx) {
+        uint64_t stripeGroupStart = mHeaderRegionSize + stripeGroupIdx * groupSize;
+        uint64_t stripeGroupEnd = stripeGroupStart + groupSize;
+
+        // Whether the current group is concluded
+        for (uint32_t zoneIdx = 0; zoneIdx < numZones; ++zoneIdx) {
+          if (zoneIdx == failedDriveId) {
+            continue;
+          }
+          auto zone = zones[zoneIdx];
+          uint64_t wp = zone.first;
+          if (stripeGroupEnd > wp % zoneSize) {
+            concluded = false;
+            break;
+          }
+        }
+
+        for (uint32_t i = 0; i < groupSize; ++i) {
+          for (uint32_t j = 0; j < numZones; ++j) {
+            stripeIdx2Offsets[i][j] = ~0;
+          }
+        }
+
+        if (concluded) {
+          // Get the metadata block
+          uint16_t* groupMetadata = reinterpret_cast<uint16_t*>(
+              buffers[1] + (stripeGroupEnd - 1) * blockSize);
+
+          for (uint32_t i = 0; i < numZones; ++i) {
+            for (uint32_t j = 0; j < groupSize; ++j) {
+              uint16_t stripeIdx = 0;
+              if (i != failedDriveId) {
+                stripeIdx = ((BlockMetadata*)(
+                        metaBufs[i] + (stripeGroupStart + j) * metadataSize
+                    ))->fields.replicated.stripeId;
+              } else {
+                stripeIdx = j;
+              }
+              // the i-th block of stripeId-th stripe is the j-th block in the group.
+              stripeIdx2Offsets[stripeIdx][i] = j;
+            }
+          }
+
+          // Repair all the stripes
+          for (uint32_t stripeIdx = 0; stripeIdx < groupSize; ++stripeIdx) {
+            uint8_t *stripe[numZones];
+            // decode data
+            for (uint32_t zoneIdx = 0; zoneIdx < numZones; ++zoneIdx) {
+              uint32_t offsetInBlocks = stripeGroupStart + stripeIdx2Offsets[stripeIdx][zoneIdx];
+              stripe[zoneIdx] = buffers[zoneIdx] + offsetInBlocks * blockSize;
+            }
+            DecodeStripe(stripeGroupStart + stripeIdx, stripe, alive, numZones,
+                Configuration::GetStripeDataSize() / Configuration::GetStripeUnitSize(),
+                failedDriveId, blockSize);
+
+            // decode metadata
+            for (uint32_t zoneIdx = 0; zoneIdx < numZones; ++zoneIdx) {
+              uint32_t offsetInBlocks = stripeGroupStart + stripeIdx2Offsets[stripeIdx][zoneIdx];
+              stripe[zoneIdx] = reinterpret_cast<uint8_t*>(&(((BlockMetadata*)(metaBufs[zoneIdx] +
+                        offsetInBlocks * metadataSize))->fields.coded));
+            }
+            DecodeStripe(stripeGroupStart + stripeIdx, stripe, alive, numZones,
+                Configuration::GetStripeDataSize() / Configuration::GetStripeUnitSize(),
+                failedDriveId, 16);
+            ((BlockMetadata*)stripe[0])->fields.replicated.stripeId = stripeIdx;
+          }
+        } else {
+          printf("NOT concluded.\n");
+          for (uint32_t i = 0; i < groupSize; ++i) {
+            for (uint32_t j = 0; j < numZones; ++j) {
+              stripeIdx2Offsets[i][j] = ~0;
+            }
+          }
+
+          for (uint32_t zoneIdx = 0; zoneIdx < numZones; ++zoneIdx) {
+            if (zoneIdx == failedDriveId) {
+              continue;
+            }
+            auto zone = zones[zoneIdx];
+            uint64_t wp = zone.first;
+            for (uint32_t blockIdx = stripeGroupStart;
+                blockIdx < wp % zoneSize; ++blockIdx) {
+              BlockMetadata *blockMetadata = (BlockMetadata*)(metaBufs[zoneIdx] + blockIdx * metadataSize);
+              uint32_t stripeIdx = blockMetadata->fields.replicated.stripeId;
+              stripeIdx2Offsets[stripeIdx][zoneIdx] = blockIdx - stripeGroupStart;
+            }
+          }
+
+          uint32_t nextValidBlock = 0;
+          // Repair all the stripes
+          for (uint32_t stripeIdx = 0; stripeIdx < groupSize; ++stripeIdx) {
+            uint8_t *stripe[numZones];
+            bool validStripe = true;
+            for (uint32_t zoneIdx = 0; zoneIdx < numZones; ++zoneIdx) {
+              if (zoneIdx == failedDriveId) {
+                stripeIdx2Offsets[stripeIdx][zoneIdx] = nextValidBlock;
+              }
+              if (stripeIdx2Offsets[stripeIdx][zoneIdx] == ~0) {
+                validStripe = false;
+                break;
+              }
+              uint32_t offsetInBlocks = stripeGroupStart + stripeIdx2Offsets[stripeIdx][zoneIdx];
+              stripe[zoneIdx] = buffers[zoneIdx] + offsetInBlocks * blockSize;
+            }
+            if (!validStripe) {
+              continue;
+            }
+            DecodeStripe(stripeGroupStart + stripeIdx, stripe, alive, numZones,
+                Configuration::GetStripeDataSize() / Configuration::GetStripeUnitSize(),
+                failedDriveId, blockSize);
+
+            // decode metadata
+            for (uint32_t zoneIdx = 0; zoneIdx < numZones; ++zoneIdx) {
+              uint32_t offsetInBlocks = stripeGroupStart + stripeIdx2Offsets[stripeIdx][zoneIdx];
+              // stripe[zoneIdx] = (metaBufs[zoneIdx] + offsetInBlocks * metadataSize);
+              stripe[zoneIdx] = reinterpret_cast<uint8_t*>(&(((BlockMetadata*)(metaBufs[zoneIdx] +
+                        offsetInBlocks * metadataSize))->fields.coded));
+            }
+            DecodeStripe(stripeGroupStart + stripeIdx, stripe, alive, numZones,
+                Configuration::GetStripeDataSize() / Configuration::GetStripeUnitSize(),
+                failedDriveId, 16);
+            ((BlockMetadata*)stripe[0])->fields.replicated.stripeId = stripeIdx;
+            nextValidBlock += 1;
+          }
+          validEnd = stripeGroupStart + nextValidBlock;
+        }
+
+        if (!concluded) {
+          // The last stripe group
+          break;
+        }
+      }
+    } else if (Configuration::GetSystemMode() == ZONEWRITE_ONLY) {
+      for (uint32_t stripeIdx = 0; stripeIdx < mDataRegionSize; ++stripeIdx) {
+        uint8_t *dataStripe[numZones];
+        uint8_t *metaStripe[numZones];
+        for (uint32_t zoneIdx = 0; zoneIdx < numZones; ++zoneIdx) {
+          auto zone = zones[zoneIdx];
+          if (zoneIdx != failedDriveId && stripeIdx + mHeaderRegionSize >= zone.first % zoneSize) {
+            printf("%u %u %u\n", stripeIdx, zone.first, zoneSize);
+            concluded = false;
+            validEnd = mHeaderRegionSize + stripeIdx;
+          }
+          dataStripe[zoneIdx] = buffers[zoneIdx] + (mHeaderRegionSize + stripeIdx) * blockSize;
+          metaStripe[zoneIdx] =
+            reinterpret_cast<uint8_t*>(&(((BlockMetadata*)(metaBufs[zoneIdx] +
+                      (mHeaderRegionSize + stripeIdx) *
+                      metadataSize))->fields.coded));
+        }
+        if (!concluded) {
+          printf("NOT concluded.\n");
+          break;
+        }
+
+        DecodeStripe(mHeaderRegionSize + stripeIdx, dataStripe, alive, numZones,
+            Configuration::GetStripeDataSize() / Configuration::GetStripeUnitSize(),
+            failedDriveId, blockSize);
+        DecodeStripe(mHeaderRegionSize + stripeIdx, metaStripe, alive, numZones,
+            Configuration::GetStripeDataSize() / Configuration::GetStripeUnitSize(),
+            failedDriveId, 16);
+      }
+    }
+
+    if (concluded) {
+    // construct the footer
+      for (uint32_t offsetInFooterRegion = 0; offsetInFooterRegion < mFooterRegionSize; ++offsetInFooterRegion) {
+        uint32_t begin = offsetInFooterRegion * (blockSize / 20);
+        uint32_t end = std::min(mDataRegionSize, begin + blockSize / 20);
+
+        for (uint32_t offsetInDataRegion = begin; offsetInDataRegion < end; ++offsetInDataRegion) {
+          uint8_t *footer = buffers[0] + (mHeaderRegionSize + mDataRegionSize + offsetInFooterRegion) * blockSize + (offsetInDataRegion - begin) * 20;
+          BlockMetadata *blockMetadata = (BlockMetadata*)(metaBufs[0] + (mHeaderRegionSize + offsetInDataRegion) * metadataSize);
+          uint32_t stripeId = blockMetadata->fields.replicated.stripeId;
+          uint32_t stripeOffset = (Configuration::GetSystemMode() == ZONEWRITE_ONLY) ?
+              offsetInDataRegion : (offsetInDataRegion - offsetInDataRegion % groupSize) + stripeId;
+          if (Configuration::CalculateDiskId(mHeaderRegionSize + stripeOffset, numZones - 1, Configuration::GetRaidLevel(), numZones) == 0) {
+            // set invalid LBA in the footer for praity blocks, or we just need to decide when reboot - it is only an implementation considerataion
+            *(uint64_t*)(footer + 0) = ~0ull;
+            *(uint64_t*)(footer + 8) = 0;
+          } else {
+            *(uint64_t*)(footer + 0) = blockMetadata->fields.coded.lba;
+            *(uint64_t*)(footer + 8) = blockMetadata->fields.coded.timestamp;
+          }
+          *(uint32_t*)(footer +16) = blockMetadata->fields.replicated.stripeId;
+        }
+      }
+      validEnd = mHeaderRegionSize + mDataRegionSize + mFooterRegionSize;
+    }
+
+    uint64_t slba = ((SegmentMetadata*)zones[1].second)->zones[0];
+    printf("Write recovered zone to %lu\n", slba);
+    memcpy(buffers[0], (SegmentMetadata*)zones[1].second, sizeof(SegmentMetadata));
+    // write the zone to the failed drive
+    for (uint64_t offset = 0; offset < validEnd; offset += 32) {
+      int error = 0;
+      bool done = false;
+      uint32_t count = std::min(32u, (uint32_t)(validEnd - offset));
+      if ((error = spdk_nvme_ns_cmd_write_with_md(
+              mDevices[0]->GetNamespace(),
+              mDevices[0]->GetIoQueue(0),
+              buffers[0] + offset * blockSize, metaBufs[0] + offset * metadataSize,
+              slba + offset, count, complete, &done, 0, 0, 0)) < 0) {
+        printf("Error in writing %d %s.\n", error, strerror(error));
+      }
+      while (!done) {
+        spdk_nvme_qpair_process_completions(mDevices[0]->GetIoQueue(0), 0);
+      }
+    }
+
+    if (concluded) {
+      bool done = false;
+      if (spdk_nvme_zns_finish_zone(
+            mDevices[0]->GetNamespace(),
+            mDevices[0]->GetIoQueue(0),
+            slba, 0, complete, &done) != 0) {
+        fprintf(stderr, "Seal error in recovering footer region.\n");
+      }
+      while (!done) {
+        spdk_nvme_qpair_process_completions(mDevices[0]->GetIoQueue(0), 0);
+      }
+    }
+  }
+
+  gettimeofday(&e, NULL);
+  double elapsed = e.tv_sec - s.tv_sec + e.tv_usec / 1000000. - s.tv_usec / 1000000.;
+  printf("Rebuild time: %.6f\n", elapsed);
+}
+
+void RAIDController::restart()
+{
+  uint64_t zoneCapacity = mDevices[0]->GetZoneCapacity();
+  std::pair<uint64_t, PhysicalAddr> *indexMap =
+    new std::pair<uint64_t, PhysicalAddr>[Configuration::GetStorageSpaceInBytes() / Configuration::GetBlockSize()];
+  std::pair<uint64_t, PhysicalAddr> defaultAddr;
+  defaultAddr.first = 0;
+  defaultAddr.second.segment = nullptr;
+  std::fill(indexMap, indexMap + Configuration::GetStorageSpaceInBytes() / Configuration::GetBlockSize(), defaultAddr);
+
+  struct timeval s, e;
+  gettimeofday(&s, NULL);
+  // Mount from an existing new array
+  // Reconstruct existing segments
+  uint32_t zoneSize = 2 * 1024 * 1024 / 4;
+  // Valid (full and open) zones and their headers
+  std::map<uint64_t, uint8_t*> zonesAndHeaders[mDevices.size()];
+  // Segment ID to (wp, SegmentMetadata)
+  std::map<uint32_t, std::vector<std::pair<uint64_t, uint8_t*>>> potentialSegments;
+
+  for (uint32_t i = 0; i < mDevices.size(); ++i) {
+    mDevices[i]->ReadZoneHeaders(zonesAndHeaders[i]);
+    for (auto zoneAndHeader : zonesAndHeaders[i]) {
+      uint64_t wp = zoneAndHeader.first;
+      SegmentMetadata *segMeta = reinterpret_cast<SegmentMetadata*>(zoneAndHeader.second);
+      if (potentialSegments.find(segMeta->segmentId) == potentialSegments.end()) {
+        potentialSegments[segMeta->segmentId].resize(mDevices.size());
+      }
+      potentialSegments[segMeta->segmentId][i] = std::pair(wp, zoneAndHeader.second);
+    }
+  }
+
+  // Filter out invalid segments
+  for (auto it = potentialSegments.begin();
+       it != potentialSegments.end(); ) {
+    auto &zones = it->second;
+    bool isValid = true;
+
+    SegmentMetadata *segMeta = nullptr;
+    for (uint32_t i = 0; i < mDevices.size(); ++i) {
+      auto zone = zones[i];
+      if (zone.second == nullptr) {
+        isValid = false;
+        break;
+      }
+
+      if (segMeta == nullptr) {
+        segMeta = reinterpret_cast<SegmentMetadata*>(zone.second);
+      }
+
+      if (memcmp(segMeta, zone.second, sizeof(SegmentMetadata)) != 0) {
+        isValid = false;
+        break;
+      }
+    }
+
+    if (!isValid) {
+      for (uint32_t i = 0; i < mDevices.size(); ++i) {
+        auto zone = zones[i];
+        uint64_t wp = zone.first;
+        SegmentMetadata *segMeta = reinterpret_cast<SegmentMetadata*>(zone.second);
+        bool done = false;
+        if (spdk_nvme_zns_reset_zone(mDevices[i]->GetNamespace(),
+            mDevices[i]->GetIoQueue(0),
+            segMeta->zones[i],
+            0, complete, &done) != 0) {
+          printf("Reset error during recovery\n");
+        }
+        while (!done) {
+          spdk_nvme_qpair_process_completions(mDevices[i]->GetIoQueue(0), 0);
+        }
+        spdk_free(segMeta); // free the allocated metadata memory
+      }
+      it = potentialSegments.erase(it);
+    } else {
+      ++it;
+    }
+  }
+
+  // reconstruct all open, sealed segments (Segment Table)
+  for (auto it = potentialSegments.begin();
+       it != potentialSegments.end(); ++it) {
+    uint32_t segmentId = it->first;
+    auto &zones = it->second;
+    RequestContextPool *rqPool = mRequestContextPoolForSegments;
+    ReadContextPool *rdPool = mReadContextPool;
+    StripeWriteContextPool *wPool = nullptr;
+
+    mNextAssignedSegmentId = std::max(segmentId + 1, mNextAssignedSegmentId);
+
+    // Check the segment is sealed or not
+    bool sealed = true;
+    uint64_t segWp = zoneSize;
+    SegmentMetadata *segMeta = nullptr;
+    for (auto zone : zones) {
+      segWp = std::min(segWp, zone.first % zoneSize);
+      segMeta = reinterpret_cast<SegmentMetadata*>(zone.second);
+    }
+    Segment *seg = nullptr;
+    if (segWp == zoneCapacity) {
+      // sealed
+      seg = new Segment(this, segmentId, rqPool, rdPool, wPool);
+      for (uint32_t i = 0; i < segMeta->numZones; ++i) {
+        Zone *zone = mDevices[i]->OpenZoneBySlba(segMeta->zones[i]);
+        seg->AddZone(zone);
+      }
+      seg->SetSegmentStatus(SEGMENT_SEALED);
+      mSealedSegments.insert(seg);
+    } else {
+      // We assume at most one open segment is created
+      wPool = mStripeWriteContextPools[0];
+      // open
+      seg = new Segment(this, segmentId, rqPool, rdPool, wPool);
+      for (uint32_t i = 0; i < segMeta->numZones; ++i) {
+        Zone *zone = mDevices[i]->OpenZoneBySlba(segMeta->zones[i]);
+        seg->AddZone(zone);
+      }
+      mOpenSegments[0] = seg;
+      seg->SetSegmentStatus(SEGMENT_NORMAL);
+    }
+    seg->SetZonesAndWpForRecovery(zones);
+  }
+
+  // For open segment: seal it if needed (position >= data region size)
+  printf("Load all blocks of open segments.\n");
+  for (uint32_t i = 0; i < mNumOpenSegments; ++i) {
+    if (mOpenSegments[i] != nullptr) {
+      mOpenSegments[i]->RecoverLoadAllBlocks();
+      if (mOpenSegments[i]->RecoverFooterRegionIfNeeded()) {
+        mSealedSegments.insert(mOpenSegments[i]);
+        mOpenSegments[i] = nullptr;
+      }
+    }
+  }
+
+  printf("Recover stripe consistency.\n");
+  // For open segment: recover stripe consistency
+  for (uint32_t i = 0; i < mNumOpenSegments; ++i) {
+    if (mOpenSegments[i] != nullptr) {
+      if (mOpenSegments[i]->RecoverNeedRewrite()) {
+        printf("Need rewrite.\n");
+        Segment *newSeg = new Segment(this, mOpenSegments[i]->GetSegmentId(),
+            mRequestContextPoolForSegments,
+            mReadContextPool,
+            mStripeWriteContextPools[i]);
+        for (uint32_t j = 0; i < mOpenSegments[i]->GetZones().size(); ++j) {
+          Zone *zone = mDevices[i]->OpenZone();
+          newSeg->AddZone(zone);
+        }
+        newSeg->RecoverFromOldSegment(mOpenSegments[i]);
+        // reset old segment
+        mOpenSegments[i]->ResetInRecovery();
+      } else {
+        printf("Recover in-flight stripes.\n");
+        mOpenSegments[i]->RecoverState();
+      }
+    } else {
+      printf("NO open segment.\n");
+    }
+  }
+
+  printf("Recover index from sealed segments.\n");
+  // Start recover L2P table and the compact stripe table
+  uint8_t *buffer = (uint8_t*)spdk_zmalloc(
+      std::max(mFooterRegionSize, mDataRegionSize / Configuration::GetStripeGroupSize())
+      * Configuration::GetBlockSize(), 4096,
+      NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+  for (Segment *segment : mSealedSegments) {
+    segment->RecoverIndexFromSealedSegment(buffer, indexMap);
+  }
+  spdk_free(buffer);
+
+  printf("Recover index from open segments.\n");
+  for (Segment *segment : mOpenSegments) {
+    if (segment) {
+      segment->RecoverIndexFromOpenSegment(indexMap);
+    }
+  }
+
+  for (uint32_t i = 0;
+      i < Configuration::GetStorageSpaceInBytes() / Configuration::GetBlockSize();
+      ++i) {
+    if (indexMap[i].second.segment == nullptr) {
+      continue;
+    }
+    mAddressMap[i] = indexMap[i].second;
+    mAddressMap[i].segment->FinishBlock(
+        mAddressMap[i].zoneId,
+        mAddressMap[i].offset,
+        i * Configuration::GetBlockSize() * 1ull);
+  }
+
+  for (Segment *segment : mSealedSegments) {
+    segment->FinishRecovery();
+  }
+
+  for (Segment *segment : mOpenSegments) {
+    if (segment) {
+      segment->FinishRecovery();
+    }
+  }
+  gettimeofday(&e, NULL);
+  double elapsed = e.tv_sec - s.tv_sec + e.tv_usec / 1000000. - s.tv_usec / 1000000.;
+  printf("Restart time: %.6f\n", elapsed);
+}
+
 void RAIDController::Init(bool need_env)
 {
   int ret = 0;
@@ -164,16 +741,17 @@ void RAIDController::Init(bool need_env)
         return strcmp(o1->GetDeviceTransportAddress(), o2->GetDeviceTransportAddress()) < 0;
       });
 
+  InitErasureCoding();
   // Adjust the capacity for user data = total capacity - footer size
   // The L2P table information at the end of the segment
-  // Each block needs (LBA + timestamp, 16 bytes) for L2P table recovery; we round the number to block size
+  // Each block needs (LBA + timestamp + stripe ID, 20 bytes) for L2P table recovery; we round the number to block size
   uint64_t zoneCapacity = mDevices[0]->GetZoneCapacity();
   uint32_t blockSize = Configuration::GetBlockSize();
-  uint32_t maxFooterSize = round_up(zoneCapacity * 16, blockSize) / blockSize;
+  uint32_t maxFooterSize = round_up(zoneCapacity, (blockSize / 20)) / (blockSize / 20);
   mHeaderRegionSize = 1;
   mDataRegionSize = round_down(zoneCapacity - mHeaderRegionSize - maxFooterSize,
-                               Configuration::GetSyncGroupSize());
-  mFooterRegionSize = round_up(mDataRegionSize * 16, blockSize) / blockSize;
+                               Configuration::GetStripeGroupSize());
+  mFooterRegionSize = round_up(mDataRegionSize, (blockSize / 20)) / (blockSize / 20);
   printf("HeaderRegion: %u, DataRegion: %u, FooterRegion: %u\n",
          mHeaderRegionSize, mDataRegionSize, mFooterRegionSize);
 
@@ -235,210 +813,17 @@ void RAIDController::Init(bool need_env)
   mOpenSegments.resize(mNumOpenSegments);
 
 
-  if (Configuration::GetIsBrandNew()) {
+  if (Configuration::GetRebootMode() == 0) {
     for (uint32_t i = 0; i < mDevices.size(); ++i) {
       mDevices[i]->EraseWholeDevice();
     }
-  } else {
-    std::pair<uint64_t, PhysicalAddr> *indexMap = 
-      new std::pair<uint64_t, PhysicalAddr>[Configuration::GetStorageSpaceInBytes() / Configuration::GetBlockSize()];
-    std::pair<uint64_t, PhysicalAddr> defaultAddr;
-    defaultAddr.first = 0;
-    defaultAddr.second.segment = nullptr;
-    std::fill(indexMap, indexMap + Configuration::GetStorageSpaceInBytes() / Configuration::GetBlockSize(), defaultAddr);
-
-    struct timeval s, e;
-    gettimeofday(&s, NULL);
-    // Mount from an existing new array
-    // Reconstruct existing segments
-    uint32_t zoneSize = 2 * 1024 * 1024 / 4;
-    // Valid (full and open) zones and their headers
-    std::map<uint64_t, uint8_t*> zonesAndHeaders[mDevices.size()];
-    // Segment ID to (wp, SegmentMetadata)
-    std::map<uint32_t, std::vector<std::pair<uint64_t, uint8_t*>>> potentialSegments; 
-
-    for (uint32_t i = 0; i < mDevices.size(); ++i) {
-      mDevices[i]->ReadZoneHeaders(zonesAndHeaders[i]);
-      for (auto zoneAndHeader : zonesAndHeaders[i]) {
-        uint64_t wp = zoneAndHeader.first;
-        SegmentMetadata *segMeta = reinterpret_cast<SegmentMetadata*>(zoneAndHeader.second);
-        if (potentialSegments.find(segMeta->segmentId) == potentialSegments.end()) {
-          potentialSegments[segMeta->segmentId].resize(mDevices.size());
-        }
-        potentialSegments[segMeta->segmentId][i] = std::pair(wp, zoneAndHeader.second);
-      }
-    }
-
-    // Filter out invalid segments
-    for (auto it = potentialSegments.begin();
-         it != potentialSegments.end(); ) {
-      auto &zones = it->second;
-      bool isValid = true;
-
-      SegmentMetadata *segMeta = nullptr;
-      for (uint32_t i = 0; i < mDevices.size(); ++i) {
-        auto zone = zones[i];
-        if (zone.second == nullptr) {
-          isValid = false;
-          break;
-        }
-
-        if (segMeta == nullptr) {
-          segMeta = reinterpret_cast<SegmentMetadata*>(zone.second);
-        }
-
-        if (memcmp(segMeta, zone.second, sizeof(SegmentMetadata)) != 0) {
-          isValid = false;
-          break;
-        }
-      }
-
-      if (!isValid) {
-        for (uint32_t i = 0; i < mDevices.size(); ++i) {
-          auto zone = zones[i];
-          uint64_t wp = zone.first;
-          SegmentMetadata *segMeta = reinterpret_cast<SegmentMetadata*>(zone.second);
-          bool done = false;
-          if (spdk_nvme_zns_reset_zone(mDevices[i]->GetNamespace(),
-              mDevices[i]->GetIoQueue(0),
-              segMeta->zones[i],
-              0, complete, &done) != 0) {
-            printf("Reset error during recovery\n");
-          }
-          while (!done) {
-            spdk_nvme_qpair_process_completions(mDevices[i]->GetIoQueue(0), 0);
-          }
-          spdk_free(segMeta); // free the allocated metadata memory
-        }
-        it = potentialSegments.erase(it);
-      } else {
-        ++it;
-      }
-    }
-
-    // reconstruct all open, sealed segments (Segment Table)
-    for (auto it = potentialSegments.begin();
-         it != potentialSegments.end(); ++it) {
-      uint32_t segmentId = it->first;
-      auto &zones = it->second;
-      RequestContextPool *rqPool = mRequestContextPoolForSegments;
-      ReadContextPool *rdPool = mReadContextPool;
-      StripeWriteContextPool *wPool = nullptr;
-
-      mNextAssignedSegmentId = std::max(segmentId + 1, mNextAssignedSegmentId);
-
-      // Check the segment is sealed or not
-      bool sealed = true;
-      uint64_t segWp = zoneSize;
-      SegmentMetadata *segMeta = nullptr;
-      for (auto zone : zones) {
-        segWp = std::min(segWp, zone.first % zoneSize);
-        segMeta = reinterpret_cast<SegmentMetadata*>(zone.second);
-      }
-      Segment *seg = nullptr;
-      if (segWp == zoneCapacity) {
-        // sealed
-        seg = new Segment(this, segmentId, rqPool, rdPool, wPool);
-        for (uint32_t i = 0; i < segMeta->numZones; ++i) {
-          Zone *zone = mDevices[i]->OpenZoneBySlba(segMeta->zones[i]);
-          seg->AddZone(zone);
-        }
-        seg->SetSegmentStatus(SEGMENT_SEALED);
-        mSealedSegments.insert(seg);
-      } else {
-        // We assume at most one open segment is created
-        wPool = mStripeWriteContextPools[0];
-        // open
-        seg = new Segment(this, segmentId, rqPool, rdPool, wPool);
-        for (uint32_t i = 0; i < segMeta->numZones; ++i) {
-          Zone *zone = mDevices[i]->OpenZoneBySlba(segMeta->zones[i]);
-          seg->AddZone(zone);
-        }
-        mOpenSegments[0] = seg;
-        seg->SetSegmentStatus(SEGMENT_NORMAL);
-      }
-      seg->SetZonesAndWpForRecovery(zones);
-    }
-
-    // For open segment: seal it if needed (position >= data region size)
-    printf("Load all blocks of open segments.\n");
-    for (uint32_t i = 0; i < mNumOpenSegments; ++i) {
-      if (mOpenSegments[i] != nullptr) {
-        mOpenSegments[i]->RecoverLoadAllBlocks();
-        if (mOpenSegments[i]->RecoverFooterRegionIfNeeded()) {
-          mSealedSegments.insert(mOpenSegments[i]);
-          mOpenSegments[i] = nullptr;
-        }
-      }
-    }
-
-    printf("Recover stripe consistency.\n");
-    // For open segment: recover stripe consistency
-    for (uint32_t i = 0; i < mNumOpenSegments; ++i) {
-      if (mOpenSegments[i] != nullptr) {
-        if (mOpenSegments[i]->RecoverNeedRewrite()) {
-          Segment *newSeg = new Segment(this, mOpenSegments[i]->GetSegmentId(),
-              mRequestContextPoolForSegments,
-              mReadContextPool,
-              mStripeWriteContextPools[i]);
-          for (uint32_t j = 0; i < mOpenSegments[i]->GetZones().size(); ++j) {
-            Zone *zone = mDevices[i]->OpenZone();
-            newSeg->AddZone(zone);
-          }
-          newSeg->RecoverFromOldSegment(mOpenSegments[i]);
-          // reset old segment
-          mOpenSegments[i]->ResetInRecovery();
-        } else {
-          mOpenSegments[i]->RecoverInflightStripes();
-        }
-      } else {
-        printf("NO open segment.\n");
-      }
-    }
-
-    printf("Recover index from sealed segments.\n");
-    // Start recover L2P table and the compact stripe table
-    uint8_t *buffer = (uint8_t*)spdk_zmalloc(
-        std::max(mFooterRegionSize, mDataRegionSize / Configuration::GetSyncGroupSize())
-        * Configuration::GetBlockSize(), 4096,
-        NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
-    for (Segment *segment : mSealedSegments) {
-      segment->RecoverIndexFromSealedSegment(buffer, indexMap);
-    }
-    spdk_free(buffer);
-
-    printf("Recover index from open segments.\n");
-    for (Segment *segment : mOpenSegments) {
-      if (segment) {
-        segment->RecoverIndexFromOpenSegment(indexMap);
-      }
-    }
-
-    for (uint32_t i = 0;
-        i < Configuration::GetStorageSpaceInBytes() / Configuration::GetBlockSize();
-        ++i) {
-      if (indexMap[i].second.segment == nullptr) {
-        continue;
-      }
-      mAddressMap[i] = indexMap[i].second;
-      mAddressMap[i].segment->FinishBlock(
-          mAddressMap[i].zoneId,
-          mAddressMap[i].offset,
-          i * Configuration::GetBlockSize() * 1ull);
-    }
-
-    for (Segment *segment : mSealedSegments) {
-      segment->FinishRecovery();
-    }
-
-    for (Segment *segment : mOpenSegments) {
-      if (segment) {
-        segment->FinishRecovery();
-      }
-    }
-    gettimeofday(&e, NULL);
-    double elapsed = e.tv_sec - s.tv_sec + e.tv_usec / 1000000. - s.tv_usec / 1000000.;
-    printf("Recovery time: %.6f\n", elapsed);
+  } else if (Configuration::GetRebootMode() == 1) {
+    restart();
+  } else { // needs rebuild; rebootMode = 2
+    // Suppose drive 0 is broken
+    mDevices[0]->EraseWholeDevice();
+    rebuild(0); // suppose rebuilding drive 0
+    restart();
   }
 
   if (Configuration::GetEventFrameworkEnabled()) {
@@ -451,11 +836,11 @@ void RAIDController::Init(bool need_env)
                  registerIoCompletionRoutine, &mIoThread[threadId], nullptr);
     }
   } else {
-    initEcThread();
+    initIoThread();
     initDispatchThread();
     initIndexThread();
     initCompletionThread();
-    initIoThread();
+    initEcThread();
   }
 
   for (uint32_t i = 0; i < mNumOpenSegments; ++i) {
@@ -630,7 +1015,7 @@ RequestContext* RAIDController::getContextForUserRequest()
     ReclaimContexts();
     ctx = mRequestContextPoolForUserRequests->GetRequestContext(false);
     if (ctx == nullptr) {
-      printf("NO AVAILABLE CONTEXT FOR USER.\n");
+//      printf("NO AVAILABLE CONTEXT FOR USER.\n");
     }
   }
 
@@ -1117,7 +1502,7 @@ bool RAIDController::progressGcWriter()
   // Process blocks that are read and valid, and rewrite them 
   RequestContext *nextWriter = &mGcTask.contextPool[mGcTask.writerPos];
   while (nextWriter->available && nextWriter->status == READ_COMPLETE) {
-    uint64_t lba = ((BlockMetadata*)nextWriter->meta)->fields.protectedField.lba;
+    uint64_t lba = ((BlockMetadata*)nextWriter->meta)->fields.coded.lba;
     if (lba == ~0ull) {
       fprintf(stderr, "GC write does not expect block with invalid lba!\n");
       exit(-1);
@@ -1132,7 +1517,7 @@ bool RAIDController::progressGcWriter()
     nextWriter->status = WRITE_REAPING;
     nextWriter->successBytes = 0;
     nextWriter->available = false;
-    nextWriter->timestamp = ((BlockMetadata*)nextWriter->meta)->fields.protectedField.timestamp;
+    nextWriter->timestamp = ((BlockMetadata*)nextWriter->meta)->fields.coded.timestamp;
 
     bool success = false;
     for (uint32_t i = 0; i < mNumOpenSegments; i += 1) {

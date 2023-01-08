@@ -5,6 +5,7 @@
 * zapraid_spdk, storing modified SPDK, with added SPDK bdev module for zapraid
 * zapraid_femu, storing modified FEMU, with added ZNS SSD latency emulation functionality
 * scripts, storing neccessary scripts for running all the experiments
+* patches, storing our modifications to SPDK and FEMU
 
 ## Building Guide
 * Be sure to read this building guide before proceeding, and be sure to read every scripts before running it when doing experiments.

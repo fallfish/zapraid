@@ -180,11 +180,8 @@ bdev_zns_raid_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_i
 static void
 bdev_zns_raid_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bdev_io)
 {
-  struct zns_raid_bdev *zns_raid_disk;
   struct zns_raid_task *zns_raid_task;
-  uint64_t offset = (uint64_t)bdev_io->u.bdev.offset_blocks * bdev_io->bdev->blocklen;
 
-  zns_raid_disk = (struct zns_raid_bdev*)bdev_io->bdev->ctxt;
   zns_raid_task = (struct zns_raid_task*)bdev_io->driver_ctx;
   zns_raid_task->num_outstanding = bdev_io->u.bdev.iovcnt;
   zns_raid_task->status = SPDK_BDEV_IO_STATUS_SUCCESS;
@@ -364,7 +361,7 @@ zns_raid_bdev_create_cb(void *io_device, void *ctx_buf)
 static void
 zns_raid_bdev_destroy_cb(void *io_device, void *ctx_buf)
 {
-  struct zns_raid_io_channel *ch = ctx_buf;
+//  struct zns_raid_io_channel *ch = ctx_buf;
 
 //  spdk_poller_unregister(&ch->poller);
 }

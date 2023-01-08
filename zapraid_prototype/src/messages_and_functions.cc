@@ -128,18 +128,29 @@ static void handleStripeUnitContext(RequestContext *context)
   switch (status) {
     case WRITE_REAPING:
       if (context->successBytes == context->targetBytes) {
-        RequestContext *parent = context->associatedRequest;
-        if (parent) {
-          parent->pbaArray[(context->lba - parent->lba) / Configuration::GetBlockSize()] = context->GetPba();
-          parent->successBytes += context->targetBytes;
-          assert(parent->successBytes <= parent->targetBytes);
-          if (contextReady(parent)) {
-            handleContext(parent);
+        StripeWriteContext *stripe = context->associatedStripe;
+        if (stripe != nullptr) {
+          stripe->successBytes += context->successBytes;
+          if (stripe->successBytes != stripe->targetBytes) {
+            break;
+          }
+
+          // Acknowledge the completion only after the whole stripe persists
+          for (auto context_ : stripe->ioContext) {
+            RequestContext *parent = context_->associatedRequest;
+            if (parent) {
+              parent->pbaArray[(context_->lba - parent->lba) / Configuration::GetBlockSize()] = context_->GetPba();
+              parent->successBytes += context_->targetBytes;
+              assert(parent->successBytes <= parent->targetBytes);
+              if (contextReady(parent)) {
+                handleContext(parent);
+              }
+            }
+            context_->segment->WriteComplete(context_);
+            status = WRITE_COMPLETE;
+            context_->available = true;
           }
         }
-        context->segment->WriteComplete(context);
-        status = WRITE_COMPLETE;
-        context->available = true;
       }
       break;
     case READ_REAPING:
@@ -151,10 +162,10 @@ static void handleStripeUnitContext(RequestContext *context)
       } else if (context->successBytes == context->targetBytes) {
         context->segment->ReadComplete(context);
         context->associatedRequest->successBytes += Configuration::GetBlockSize();
+        assert(context->associatedRequest->successBytes <= context->associatedRequest->targetBytes);
         if (contextReady(context->associatedRequest)) {
           handleContext(context->associatedRequest);
         }
-        assert(context->associatedRequest->successBytes <= context->associatedRequest->targetBytes);
 
         status = READ_COMPLETE;
         context->available = true;
@@ -514,6 +525,7 @@ void zoneFinish(void *args)
 void tryDrainController(void *args)
 {
   DrainArgs *drainArgs = (DrainArgs *)args;
+  drainArgs->ctrl->CheckSegments();
   drainArgs->ctrl->ReclaimContexts();
   drainArgs->ctrl->ProceedGc();
   drainArgs->success = drainArgs->ctrl->GetNumInflightRequests() == 0 && !drainArgs->ctrl->ExistsGc();

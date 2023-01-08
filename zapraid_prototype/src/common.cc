@@ -5,6 +5,22 @@
 #include <spdk/event.h>
 #include <sys/time.h>
 #include <queue>
+#include <isa-l.h>
+
+static uint8_t *gEncodeMatrix = nullptr;
+static uint8_t *gGfTables = nullptr;
+
+void InitErasureCoding() {
+  int n = Configuration::GetStripeSize() / Configuration::GetStripeUnitSize();
+  int k = Configuration::GetStripeDataSize() / Configuration::GetStripeUnitSize();
+
+  gEncodeMatrix = new uint8_t[n * k];
+  gGfTables = new uint8_t[32 * n * (n - k)];
+  gf_gen_rs_matrix(gEncodeMatrix, n, k);
+  ec_init_tables(k, n - k, &gEncodeMatrix[k * k], gGfTables);
+  printf("gGfTables: %p\n", gGfTables);
+}
+
 
 void completeOneEvent(void *arg, const struct spdk_nvme_cpl *completion)
 {
@@ -95,6 +111,13 @@ void RequestContext::PrintStats()
       type, status, lba, size,
       ioContext.data, ioContext.metadata,
       ioContext.offset, ioContext.size);
+}
+
+double GetTimestampInUs()
+{
+  struct timeval s;
+  gettimeofday(&s, NULL);
+  return s.tv_sec + s.tv_usec / 1000000.0;
 }
 
 double timestamp()
@@ -335,4 +358,96 @@ bool StripeWriteContextPool::checkStripeAvailable(StripeWriteContext *stripe) {
   }
 
   return isAvailable;
+}
+
+void DecodeStripe(uint32_t offset, uint8_t **stripe,
+    bool *alive, uint32_t n, uint32_t k,
+    uint32_t decodeZid, uint32_t unitSize)
+{
+  RAIDLevel raidLevel = Configuration::GetRaidLevel();
+  if (raidLevel == RAID1) {
+    memcpy(stripe[decodeZid], stripe[1 - decodeZid], unitSize);
+    return;
+  }
+
+  uint8_t *input[k];
+  uint8_t *output[1];
+  uint8_t decodeGfTbl[32 * n * (n - k)];
+  uint8_t recoverMatrix[k * k];
+  uint8_t invRecoverMatrix[k * k];
+  uint8_t decodeMatrix[n * k]; // [k:k] to [n:k] stores coefficients for the to-decode chunk part
+  memset(decodeGfTbl, 0, sizeof(decodeGfTbl));
+  memset(recoverMatrix, 0, sizeof(recoverMatrix));
+  memset(invRecoverMatrix, 0, sizeof(invRecoverMatrix));
+  memset(decodeMatrix, 0, sizeof(decodeMatrix));
+
+  uint32_t mapping[n];
+  uint32_t decodeIndex;
+  for (uint32_t i = 0; i < n; ++i) {
+    uint32_t zid = Configuration::CalculateDiskId(offset, i, raidLevel, n);
+    if (alive[zid]) {
+      mapping[i] = zid;
+    } else {
+      mapping[i] = ~0u;
+    }
+    if (zid == decodeZid) {
+      decodeIndex = i;
+    }
+  }
+
+  for (uint32_t i = 0, j = 0; i < n; ++i) {
+    if (mapping[i] == ~0u) continue; // alive[i] == false must implies that i is not decodeIndex
+    if (j == k) break;
+    memcpy(recoverMatrix + j * k,
+           gEncodeMatrix + i * k,
+           k * sizeof(uint8_t));
+    j++;
+  }
+  gf_invert_matrix(recoverMatrix, invRecoverMatrix, k);
+
+  for (uint32_t i = 0; i < k; ++i) {
+    decodeMatrix[i * k + i] = 1;
+  }
+
+  if (decodeIndex < k) { // a data block need decoding
+    memcpy(decodeMatrix + (0 + k) * k, invRecoverMatrix + decodeIndex * k, k * sizeof(uint8_t));
+  } else { // a parity block need decoding
+    for (uint32_t col = 0; col < k; ++col) {
+      uint8_t s = 0;
+      for (uint32_t row = 0; row < k; ++row) {
+        s ^= gf_mul(invRecoverMatrix[row * k + col],
+                    gEncodeMatrix[k * decodeIndex + row]);
+      }
+      decodeMatrix[(0 + k) * k + col] = s;
+    }
+  }
+  ec_init_tables(k, 1, &decodeMatrix[k * k], decodeGfTbl);
+
+  for (uint32_t i = 0, j = 0, l = 0; i < n; ++i) {
+    if (i == decodeIndex) {
+      output[l] = stripe[decodeZid];
+      l++;
+    } else if (mapping[i] != ~0u) {
+      input[j] = stripe[mapping[i]];
+      j++;
+    }
+  }
+  ec_encode_data(unitSize, k, 1, decodeGfTbl, input, output);
+}
+
+void EncodeStripe(uint8_t **stripe, uint32_t n, uint32_t k, uint32_t unitSize)
+{
+  uint8_t *input[k];
+  uint8_t *output[n - k];
+  for (int i = 0; i < k; ++i) {
+    input[i] = stripe[i];
+  }
+  for (int i = 0; i < n - k; ++i) {
+    output[i] = stripe[k + i];
+  }
+  if (Configuration::GetRaidLevel() == RAID1) {
+    memcpy(output[0], input[0], unitSize);
+  } else {
+    ec_encode_data(unitSize, k, n - k, gGfTables, input, output);
+  }
 }

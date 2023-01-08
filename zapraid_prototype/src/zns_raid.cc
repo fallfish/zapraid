@@ -53,7 +53,7 @@ extern "C" void zns_raid_set_gc(bool enable)
 }
 
 extern "C" void zns_raid_set_sync_group_size(uint32_t group_size) {
-  Configuration::SetSyncGroupSize(group_size);
+  Configuration::SetStripeGroupSize(group_size);
 }
 
 extern "C" void zns_raid_set_degraded_read(bool enable) {

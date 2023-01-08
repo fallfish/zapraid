@@ -156,6 +156,9 @@ private:
   bool progressGcWriter();
   bool progressGcReader();
 
+  void restart();
+  void rebuild(uint32_t failedDriveId);
+
   std::vector<Device*> mDevices;
   std::unordered_set<Segment*> mSealedSegments;
   std::vector<Segment*> mSegmentsToSeal;

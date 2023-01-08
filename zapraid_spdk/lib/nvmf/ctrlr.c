@@ -20,7 +20,7 @@
 #include "spdk/log.h"
 #include "spdk_internal/usdt.h"
 
-#define MIN_KEEP_ALIVE_TIMEOUT_IN_MS 60000
+#define MIN_KEEP_ALIVE_TIMEOUT_IN_MS 10000
 #define NVMF_DISC_KATO_IN_MS 120000
 #define KAS_TIME_UNIT_IN_MS 100
 #define KAS_DEFAULT_VALUE (MIN_KEEP_ALIVE_TIMEOUT_IN_MS / KAS_TIME_UNIT_IN_MS)
@@ -361,7 +361,7 @@ nvmf_ctrlr_create(struct spdk_nvmf_subsystem *subsystem,
 	if (ctrlr->subsys->flags.ana_reporting) {
 		ctrlr->feat.async_event_configuration.bits.ana_change_notice = 1;
 	}
-	ctrlr->feat.volatile_write_cache.bits.wce = 1;
+	ctrlr->feat.volatile_write_cache.bits.wce = 0; // disable the write cache; in our zapraid case, there is no volatile cache.
 	/* Coalescing Disable */
 	ctrlr->feat.interrupt_vector_configuration.bits.cd = 1;
 
@@ -2680,7 +2680,7 @@ spdk_nvmf_ctrlr_identify_ctrlr(struct spdk_nvmf_ctrlr *ctrlr, struct spdk_nvme_c
 		cdata->cqes.min = 4;
 		cdata->cqes.max = 4;
 		cdata->nn = subsystem->max_nsid;
-		cdata->vwc.present = 1;
+		cdata->vwc.present = 0;  // vwc not present for zapraid
 		cdata->vwc.flush_broadcast = SPDK_NVME_FLUSH_BROADCAST_NOT_SUPPORTED;
 
 		cdata->nvmf_specific = ctrlr->cdata.nvmf_specific;

@@ -1,0 +1,149 @@
+diff --git a/hw/femu/femu.c b/hw/femu/femu.c
+index 7e0b8de61..dbd04c43b 100644
+--- a/hw/femu/femu.c
++++ b/hw/femu/femu.c
+@@ -333,7 +333,8 @@ static void nvme_ns_init_identify(FemuCtrl *n, NvmeIdNs *id_ns)
+     id_ns->npda = id_ns->npdg = npdg - 1;
+ 
+     for (int i = 0; i < n->nlbaf; i++) {
+-        id_ns->lbaf[i].lbads = BDRV_SECTOR_BITS + i;
++//        id_ns->lbaf[i].lbads = BDRV_SECTOR_BITS + i;
++        id_ns->lbaf[i].lbads = 12;
+         id_ns->lbaf[i].ms    = cpu_to_le16(n->meta);
+     }
+ }
+diff --git a/hw/femu/meson.build b/hw/femu/meson.build
+index e24482154..9fef148e0 100644
+--- a/hw/femu/meson.build
++++ b/hw/femu/meson.build
+@@ -1 +1 @@
+-softmmu_ss.add(when: 'CONFIG_FEMU_PCI', if_true: files('dma.c', 'intr.c', 'nvme-util.c', 'nvme-admin.c', 'nvme-io.c', 'femu.c', 'nossd/nop.c', 'nand/nand.c', 'timing-model/timing.c', 'ocssd/oc12.c', 'ocssd/oc20.c', 'zns/zns.c', 'bbssd/bb.c', 'bbssd/ftl.c', 'lib/pqueue.c', 'lib/rte_ring.c', 'backend/dram.c'))
++softmmu_ss.add(when: 'CONFIG_FEMU_PCI', if_true: files('dma.c', 'intr.c', 'nvme-util.c', 'nvme-admin.c', 'nvme-io.c', 'femu.c', 'nossd/nop.c', 'nand/nand.c', 'timing-model/timing.c', 'ocssd/oc12.c', 'ocssd/oc20.c', 'zns/zns.c', 'zns/zns_ftl.c', 'bbssd/bb.c', 'bbssd/ftl.c', 'lib/pqueue.c', 'lib/rte_ring.c', 'backend/dram.c'))
+diff --git a/hw/femu/nvme.h b/hw/femu/nvme.h
+index 1b4f681cd..dcad8045d 100644
+--- a/hw/femu/nvme.h
++++ b/hw/femu/nvme.h
+@@ -989,6 +989,7 @@ typedef struct NvmeRequest {
+ 
+     /* ZNS */
+     void                    *opaque;
++    uint32_t                 n_reset_zones;
+ 
+     /* position in the priority queue for delay emulation */
+     size_t                  pos;
+diff --git a/hw/femu/zns/zns.c b/hw/femu/zns/zns.c
+index d970c0e61..d2bfe82f1 100644
+--- a/hw/femu/zns/zns.c
++++ b/hw/femu/zns/zns.c
+@@ -1,4 +1,5 @@
+ #include "./zns.h"
++#include "./zns_ftl.h"
+ 
+ #define MIN_DISCARD_GRANULARITY     (4 * KiB)
+ #define NVME_DEFAULT_ZONE_SIZE      (128 * MiB)
+@@ -623,6 +624,7 @@ static uint16_t zns_reset_zone(NvmeNamespace *ns, NvmeZone *zone,
+     }
+ 
+     zns_aio_zone_reset_cb(req, zone);
++    zns_zone_erase(ns->ctrl->ssd, req, zone);
+ 
+     return NVME_SUCCESS;
+ }
+@@ -1097,10 +1099,13 @@ static uint16_t zns_do_write(FemuCtrl *n, NvmeRequest *req, bool append,
+             goto err;
+         }
+ 
+-        backend_rw(n->mbe, &req->qsg, &data_offset, req->is_write);
++        backend_rw(n->mbe, &req->qsg, &data_offset, true);
+     }
+ 
+     zns_finalize_zoned_write(ns, req, false);
++    req->slba = res->slba;
++    req->nlb = nlb;
++
+     return NVME_SUCCESS;
+ 
+ err:
+@@ -1169,6 +1174,10 @@ static uint16_t zns_read(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
+     data_offset = zns_l2b(ns, slba);
+ 
+     backend_rw(n->mbe, &req->qsg, &data_offset, req->is_write);
++
++    req->slba = slba;
++    req->nlb = nlb;
++
+     return NVME_SUCCESS;
+ 
+ err:
+@@ -1224,6 +1233,9 @@ static uint16_t zns_write(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
+     backend_rw(n->mbe, &req->qsg, &data_offset, req->is_write);
+     zns_finalize_zoned_write(ns, req, false);
+ 
++    req->slba = slba;
++    req->nlb = nlb;
++
+     return NVME_SUCCESS;
+ 
+ err:
+@@ -1234,20 +1246,31 @@ err:
+ static uint16_t zns_io_cmd(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
+                            NvmeRequest *req)
+ {
++    uint16_t ret = 0;
+     switch (cmd->opcode) {
+     case NVME_CMD_READ:
+-        return zns_read(n, ns, cmd, req);
++        ret = zns_read(n, ns, cmd, req);
++        break;
+     case NVME_CMD_WRITE:
+-        return zns_write(n, ns, cmd, req);
++        ret = zns_write(n, ns, cmd, req);
++        break;
+     case NVME_CMD_ZONE_MGMT_SEND:
+-        return zns_zone_mgmt_send(n, req);
++        ret = zns_zone_mgmt_send(n, req);
++        break;
+     case NVME_CMD_ZONE_MGMT_RECV:
+-        return zns_zone_mgmt_recv(n, req);
++        ret = zns_zone_mgmt_recv(n, req);
++        break;
+     case NVME_CMD_ZONE_APPEND:
+-        return zns_zone_append(n, req);
++        ret = zns_zone_append(n, req);
++        break;
++    default:
++        ret = NVME_INVALID_OPCODE | NVME_DNR;
++        break;
+     }
+ 
+-    return NVME_INVALID_OPCODE | NVME_DNR;
++    zns_process_latency_emulation(n->ssd, req);
++
++    return ret;
+ }
+ 
+ static void zns_set_ctrl_str(FemuCtrl *n)
+@@ -1272,7 +1295,7 @@ static int zns_init_zone_cap(FemuCtrl *n)
+ {
+     n->zoned = true;
+     n->zasl_bs = NVME_DEFAULT_MAX_AZ_SIZE;
+-    n->zone_size_bs = NVME_DEFAULT_ZONE_SIZE;
++    n->zone_size_bs = n->ssd->sp.zone_size;
+     n->zone_cap_bs = 0;
+     n->cross_zone_read = false;
+     n->max_active_zones = 0;
+@@ -1306,6 +1329,14 @@ static void zns_init(FemuCtrl *n, Error **errp)
+ 
+     zns_set_ctrl(n);
+ 
++    struct ssd *ssd = n->ssd = g_malloc0(sizeof(struct ssd));
++
++    ssd->dataplane_started_ptr = &n->dataplane_started;
++    ssd->ssdname = (char *)n->devname;
++    femu_debug("Starting FEMU in ZNS-SSD mode ...\n");
++
++    zns_ftl_init(n);
++
+     zns_init_zone_cap(n);
+ 
+     if (zns_init_zone_geometry(ns, errp) != 0) {

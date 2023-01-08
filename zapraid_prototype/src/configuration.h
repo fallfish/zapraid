@@ -1,6 +1,5 @@
 enum SystemMode {
-  ZONEWRITE_ONLY, ZONEAPPEND_ONLY,
-  GROUP_LAYOUT, ZAPRAID
+  ZONEWRITE_ONLY, ZONEAPPEND_ONLY, ZAPRAID
 };
 
 enum RAIDLevel {
@@ -43,7 +42,7 @@ public:
 
   static void PrintConfigurations() {
     Configuration &instance = GetInstance();
-    const char *systemModeStrs[] = {"ZoneWrite-Only", "ZoneAppend-Only", "GroupLayout", "ZapRAID"};
+    const char *systemModeStrs[] = {"ZoneWrite-Only", "ZoneAppend-Only", "ZapRAID"};
     printf("ZapRAID Configuration:\n");
     printf("-- Raid mode: %d %d %d --\n",
         instance.gStripeDataSize,
@@ -115,12 +114,12 @@ public:
     return GetInstance().gEnableGc;
   }
 
-  static void SetSyncGroupSize(uint32_t groupSize) {
-    GetInstance().gSyncGroupSize = groupSize;
+  static void SetStripeGroupSize(uint32_t groupSize) {
+    GetInstance().gStripeGroupSize = groupSize;
   }
 
-  static int GetSyncGroupSize() {
-    return GetInstance().gSyncGroupSize;
+  static int GetStripeGroupSize() {
+    return GetInstance().gStripeGroupSize;
   }
 
   static void SetEnableDegradedRead(bool enable) {
@@ -159,12 +158,12 @@ public:
     return false;
   }
 
-  static void SetIsBrandNew(bool isNew) {
-    GetInstance().gIsBrandNew = isNew;
+  static void SetRebootMode(uint32_t rebootMode) {
+    GetInstance().gRebootMode = rebootMode;
   }
 
-  static bool GetIsBrandNew() {
-    return GetInstance().gIsBrandNew;
+  static uint32_t GetRebootMode() {
+    return GetInstance().gRebootMode;
   }
 
   static uint32_t GetReceiverThreadCoreId() {
@@ -260,7 +259,7 @@ public:
   }
 
 private:
-  bool gIsBrandNew = true;
+  uint32_t gRebootMode = 0; // 0: new, 1: restart, 2: rebuild.
 
   int gStripeSize = 4096 * 4;
   int gStripeDataSize = 4096 * 3;
@@ -274,7 +273,7 @@ private:
   int gZoneCapacity = 0;
   int gStripePersistencyMode = 0;
   bool gEnableGc = true;
-  int gSyncGroupSize = 256;
+  int gStripeGroupSize = 256;
   bool gEnableDegradedRead = false;
   uint32_t gNumOpenSegments = 1;
   RAIDLevel gRaidScheme = RAID5;

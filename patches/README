@@ -1,0 +1,2 @@
+The patches summarize the changes we made to SPDK (commit 351271) and FEMU (commit b388b4).
+They are created using git diff > patch and can be applied using git apply patch
