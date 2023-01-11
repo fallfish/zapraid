@@ -9,9 +9,9 @@
 #include <rte_errno.h>
 
 // a simple test program to ZapRAID
-uint64_t gSize = 20u * 1024 * 1024 * 1024 * 3 / Configuration::GetBlockSize();
-uint32_t numLoops = 2;
+uint64_t gSize = 64 * 1024 * 1024 / Configuration::GetBlockSize();
 uint32_t numBuffers = 1024 * 128;
+bool gCrash = false;
 
 RAIDController *gRaidController;
 uint8_t *buffer_pool;
@@ -47,7 +47,7 @@ void validate()
   struct timeval s, e;
   gettimeofday(&s, NULL);
 //  Configuration::SetEnableDegradedRead(true);
-  for (uint64_t i = 0; i < gSize / 10; ++i) {
+  for (uint64_t i = 0; i < gSize; ++i) {
     LatencyBucket b;
     gettimeofday(&b.s, NULL);
     bool done;
@@ -68,7 +68,7 @@ void validate()
     }
   }
   printf("Read finish\n");
-  gRaidController->Drain();
+//  gRaidController->Drain();
   gettimeofday(&e, NULL);
   double mb = (double)gSize * Configuration::GetBlockSize() / 1024 / 1024;
   double elapsed = e.tv_sec - s.tv_sec + e.tv_usec / 1000000. - s.tv_usec / 1000000.;
@@ -89,7 +89,7 @@ int main(int argc, char *argv[])
 {
   // Retrieve the options:
   int opt;
-  while ((opt = getopt(argc, argv, "m:n:s:")) != -1) {  // for each option...
+  while ((opt = getopt(argc, argv, "m:n:s:c:")) != -1) {  // for each option...
     switch (opt) {
       case 'm':
         Configuration::SetSystemMode(SystemMode(atoi(optarg)));
@@ -99,6 +99,9 @@ int main(int argc, char *argv[])
         break;
       case 's':
         gSize = atoi(optarg) * 1024 * 1024 * 1024ull / Configuration::GetBlockSize();
+        break;
+      case 'c':
+        gCrash = atoi(optarg);
         break;
       default:
         fprintf(stderr, "Unknown option %c\n", opt);
@@ -127,31 +130,44 @@ int main(int argc, char *argv[])
           1 * Configuration::GetBlockSize(),
           buckets[i].buffer,
           nullptr, nullptr);
-    //  std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
       totalSize += 4096;
     }
-    for (int loop = 0; loop < numLoops; ++loop) {
-      for (uint64_t i = 0; i < gSize; i += random() % 7 + 1) {
-        buckets[i].buffer = buffer_pool + i % numBuffers * Configuration::GetBlockSize();
-        memset(buckets[i].buffer, 0, 4096);
-        sprintf((char*)buckets[i].buffer, "temp%u", i * 7);
-        gettimeofday(&buckets[i].s, NULL);
-        gRaidController->Write(i * Configuration::GetBlockSize(),
-                               1 * Configuration::GetBlockSize(),
-                               buckets[i].buffer,
-                               nullptr, nullptr);
-      }
+
+    // Make a new segment of 100 MiB on purpose (for the crash recovery exps)
+    uint64_t numSegs = gSize / (gRaidController->GetDataRegionSize() * 3);
+    uint64_t toFill = 0;
+    if (gSize % (gRaidController->GetDataRegionSize() * 3) > 100 * 256) {
+      toFill = (numSegs + 1) * (gRaidController->GetDataRegionSize() * 3) + 100 * 256 - gSize;
+    } else {
+      toFill = gSize % (gRaidController->GetDataRegionSize() * 3);
+    }
+
+    for (uint64_t i = 0; i < toFill; i += 1) {
+      buckets[i].buffer = buffer_pool + i % numBuffers * Configuration::GetBlockSize();
+      sprintf((char*)buckets[i].buffer, "temp%u", i * 7);
+      gettimeofday(&buckets[i].s, NULL);
+      gRaidController->Write(i * Configuration::GetBlockSize(),
+          1 * Configuration::GetBlockSize(),
+          buckets[i].buffer,
+          nullptr, nullptr);
+
       totalSize += 4096;
     }
-    gRaidController->Drain();
+
+    if (gCrash) { // inject crash
+      Configuration::SetInjectCrash();
+      sleep(5);
+    } else {
+      gRaidController->Drain();
+    }
 
     gettimeofday(&e, NULL);
     double mb = totalSize / 1024 / 1024;
     double elapsed = e.tv_sec - s.tv_sec + e.tv_usec / 1000000. - s.tv_usec / 1000000.;
-    printf("Total: %.2f MiB/s, Throughtput: %.2f MiB/s\n", mb, mb / elapsed);
+    printf("Total: %.2f MiB, Throughtput: %.2f MiB/s\n", mb, mb / elapsed);
   }
 
-  validate();
+//  validate();
   delete gRaidController;
 }

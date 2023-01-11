@@ -3,10 +3,6 @@
 #include <sys/time.h>
 #include "raid_controller.h"
 
-void b()
-{}
-
-
 Segment::Segment(RAIDController *raidController,
                  uint32_t segmentId,
                  RequestContextPool *ctxPool,
@@ -166,7 +162,7 @@ bool Segment::StateTransition()
     if (mPos == mHeaderRegionSize + mDataRegionSize) {
       mSegmentStatus = SEGMENT_PREPARE_FOOTER;
     } else {
-      if (timestamp - mLastStripeCreationTimestamp >= 0.001) {
+      if (!Configuration::InjectCrash() && timestamp - mLastStripeCreationTimestamp >= 0.001) {
         // fill and flush the last stripe if no further write request for 200us interval
         FlushCurrentStripe();
       }
@@ -1024,7 +1020,7 @@ void Segment::RecoverLoadAllBlocks()
             stripeOffset, mZones.size() - 1,
             Configuration::GetRaidLevel(), mZones.size())
          ) {
-        // parity; another case is about stripe metadata
+        // parity
         mCodedBlockMetadata[index].lba = ~0ull;
         mCodedBlockMetadata[index].timestamp = 0;
       } else {
@@ -1311,16 +1307,17 @@ void Segment::RecoverFromOldSegment(Segment *oldSegment)
 {
   // First, write the header region
   uint32_t counter = mZones.size();
+  RequestContext *contexts[mZones.size()];
   for (uint32_t i = 0; i < mZones.size(); ++i) {
     Zone *zone = mZones[i];
-    memcpy(mAdminStripe->data + i * Configuration::GetBlockSize(), &mSegmentMeta, sizeof(mSegmentMeta));
+    contexts[i] = mRequestContextPool->GetRequestContext(false);
+    memcpy(contexts[i]->dataBuffer, &mSegmentMeta, sizeof(mSegmentMeta));
 
     if (spdk_nvme_ns_cmd_write_with_md(
             zone->GetDevice()->GetNamespace(),
             zone->GetDevice()->GetIoQueue(0),
-            mAdminStripe->data + i * Configuration::GetBlockSize(),
-            mAdminStripe->metadata + i * Configuration::GetMetadataSize(),
-            0, 1, completeOneEvent, &counter, 0, 0, 0) != 0) {
+            contexts[i]->dataBuffer, contexts[i]->metadataBuffer,
+            zone->GetSlba(), 1, completeOneEvent, &counter, 0, 0, 0) != 0) {
       fprintf(stderr, "Write error in writing the header for new segment.\n");
     }
   }
@@ -1335,10 +1332,10 @@ void Segment::RecoverFromOldSegment(Segment *oldSegment)
   // Then, rewrite all valid blocks
   uint32_t checkpoint = ~0u;
   if (Configuration::GetSystemMode() == ZAPRAID) {
-    for (uint32_t i = 0; i < mZonesWpForRecovery.size(); ++i) {
-      Zone *zone = mZones[i];
+    for (uint32_t i = 0; i < oldSegment->mZonesWpForRecovery.size(); ++i) {
+      Zone *zone = oldSegment->mZones[i];
       uint64_t zslba = zone->GetSlba();
-      uint32_t wp = mZonesWpForRecovery[i].first - zslba;
+      uint32_t wp = oldSegment->mZonesWpForRecovery[i].first - zslba;
       uint32_t lastCheckpoint = (wp - mHeaderRegionSize) /
           Configuration::GetStripeGroupSize() *
           Configuration::GetStripeGroupSize();
@@ -1350,28 +1347,30 @@ void Segment::RecoverFromOldSegment(Segment *oldSegment)
       }
     }
   } else if (Configuration::GetSystemMode() == ZONEWRITE_ONLY) {
-    for (uint32_t i = 0; i < mZonesWpForRecovery.size(); ++i) {
-      Zone *zone = mZones[i];
+    for (uint32_t i = 0; i < oldSegment->mZonesWpForRecovery.size(); ++i) {
+      Zone *zone = oldSegment->mZones[i];
       uint64_t zslba = zone->GetSlba();
-      uint32_t wp = mZonesWpForRecovery[i].first - zslba;
+      uint32_t wp = oldSegment->mZonesWpForRecovery[i].first - zslba;
       checkpoint = std::min(wp, checkpoint);
     }
   }
-
   // Blocks (both data and parity) before the checkpoint can be kept as is.
   for (uint32_t i = 0; i < checkpoint; ++i) {
-    Zone *zone = mZones[i];
+    struct timeval s, e;
+    gettimeofday(&s, NULL);
     uint32_t counter = mZones.size();
     for (uint32_t j = 0; j < mZones.size(); ++j) {
-      uint32_t index = j * mDataRegionSize + i;
+      Zone *zone = mZones[j];
+      memcpy(contexts[j]->dataBuffer, oldSegment->mDataBufferForRecovery[j] + i * Configuration::GetBlockSize(), 4096);
+      memcpy(contexts[j]->metadataBuffer, oldSegment->mMetadataBufferForRecovery[j] + i * Configuration::GetMetadataSize(), 4096);
       if (spdk_nvme_ns_cmd_write_with_md(
             zone->GetDevice()->GetNamespace(),
             zone->GetDevice()->GetIoQueue(0),
-            oldSegment->mDataBufferForRecovery[j] + i * Configuration::GetBlockSize(),
-            oldSegment->mMetadataBufferForRecovery[j] + i * Configuration::GetMetadataSize(),
+            contexts[j]->dataBuffer, contexts[j]->metadataBuffer,
             zone->GetSlba() + mHeaderRegionSize + i, 1, completeOneEvent, &counter, 0, 0, 0) != 0) {
         fprintf(stderr, "Write error in writing the previous groups for new segment.\n");
       }
+      uint32_t index = j * mDataRegionSize + i;
       mCodedBlockMetadata[index].lba = oldSegment->mCodedBlockMetadata[index].lba;
       mCodedBlockMetadata[index].timestamp = oldSegment->mCodedBlockMetadata[index].timestamp;
       if (Configuration::GetStripeGroupSize() <= 256) {
@@ -1391,6 +1390,8 @@ void Segment::RecoverFromOldSegment(Segment *oldSegment)
         spdk_nvme_qpair_process_completions(zone->GetDevice()->GetIoQueue(0), 0);
       }
     }
+    gettimeofday(&e, NULL);
+    double elapsed = e.tv_sec - s.tv_sec + e.tv_usec / 1000000. - s.tv_usec / 1000000.;
   }
 
   // For blocks in the last group
@@ -1416,7 +1417,21 @@ void Segment::RecoverFromOldSegment(Segment *oldSegment)
 
     for (uint32_t i = 0; i < numZones; ++i) {
       uint32_t index = i * mDataRegionSize + checkpoint + maxStripeId;
-      BlockMetadata *blockMeta = reinterpret_cast<BlockMetadata*>(oldSegment->mMetadataBufferForRecovery[i] + blocks[i] * Configuration::GetMetadataSize());
+      BlockMetadata *blockMeta = reinterpret_cast<BlockMetadata*>(
+          oldSegment->mMetadataBufferForRecovery[i] + blocks[i] * Configuration::GetMetadataSize());
+
+      if (i == Configuration::CalculateDiskId(
+            mHeaderRegionSize + index, mZones.size() - 1,
+            Configuration::GetRaidLevel(), mZones.size())
+         ) {
+        // parity
+        mCodedBlockMetadata[index].lba = ~0ull;
+        mCodedBlockMetadata[index].timestamp = 0;
+      } else {
+        mCodedBlockMetadata[index].lba = blockMeta->fields.coded.lba;
+        mCodedBlockMetadata[index].timestamp = blockMeta->fields.coded.timestamp;
+      }
+
       blockMeta->fields.replicated.stripeId = maxStripeId;
       if (Configuration::GetStripeGroupSize() <= 256) {
         mCompactStripeTable[index] = maxStripeId;
@@ -1437,6 +1452,7 @@ void Segment::RecoverFromOldSegment(Segment *oldSegment)
             1, completeOneEvent, &counter, 0, 0, 0) != 0) {
         fprintf(stderr, "Write error in rewriting the last group in the new segment.\n");
       }
+      // printf("%u %u %s\n", mCodedBlockMetadata[index].lba, mCompactStripeTable[index], oldSegment->mDataBufferForRecovery[j] + i * Configuration::GetBlockSize());
     }
     while (counter != 0) {
       for (uint32_t i = 0; i < mZones.size(); ++i) {
@@ -1470,9 +1486,11 @@ void Segment::ResetInRecovery()
           zone->GetSlba(), 0, complete, &done) != 0) {
       fprintf(stderr, "Reset error in recovering.\n");
     }
-    while (!done) {
+    while (!done)
+    {
       spdk_nvme_qpair_process_completions(zone->GetDevice()->GetIoQueue(0), 0);
     }
+    zone->GetDevice()->ReturnZone(zone);
   }
 }
 

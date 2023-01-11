@@ -26,12 +26,28 @@ void completeOneEvent(void *arg, const struct spdk_nvme_cpl *completion)
 {
   uint32_t *counter = (uint32_t*)arg;
   (*counter)--;
+
+  if (spdk_nvme_cpl_is_error(completion)) {
+    fprintf(stderr, "I/O error status: %s\n", spdk_nvme_cpl_get_status_string(&completion->status));
+    fprintf(stderr, "I/O failed, aborting run\n");
+    assert(0);
+    exit(1);
+  }
+
 }
 
 void complete(void *arg, const struct spdk_nvme_cpl *completion)
 {
   bool *done = (bool*)arg;
   *done = true;
+
+  if (spdk_nvme_cpl_is_error(completion)) {
+    fprintf(stderr, "I/O error status: %s\n", spdk_nvme_cpl_get_status_string(&completion->status));
+    fprintf(stderr, "I/O failed, aborting run\n");
+    assert(0);
+    exit(1);
+  }
+
 }
 
 void thread_send_msg(spdk_thread *thread, spdk_msg_fn fn, void *args)

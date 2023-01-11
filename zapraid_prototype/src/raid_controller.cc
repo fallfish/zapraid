@@ -648,13 +648,14 @@ void RAIDController::restart()
             mRequestContextPoolForSegments,
             mReadContextPool,
             mStripeWriteContextPools[i]);
-        for (uint32_t j = 0; i < mOpenSegments[i]->GetZones().size(); ++j) {
-          Zone *zone = mDevices[i]->OpenZone();
+        for (uint32_t j = 0; j < mOpenSegments[i]->GetZones().size(); ++j) {
+          Zone *zone = mDevices[j]->OpenZone();
           newSeg->AddZone(zone);
         }
         newSeg->RecoverFromOldSegment(mOpenSegments[i]);
         // reset old segment
         mOpenSegments[i]->ResetInRecovery();
+        mOpenSegments[i] = newSeg;
       } else {
         printf("Recover in-flight stripes.\n");
         mOpenSegments[i]->RecoverState();

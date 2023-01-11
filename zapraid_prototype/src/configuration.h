@@ -214,6 +214,14 @@ public:
     return GetInstance().gEnableRedirection;
   }
 
+  static void SetInjectCrash() {
+    GetInstance().gInjectCrash = true;
+  }
+
+  static bool InjectCrash() {
+    return GetInstance().gInjectCrash;
+  }
+
 
   static uint32_t CalculateDiskId(uint32_t stripeId, uint32_t whichBlock, RAIDLevel raidScheme, uint32_t numDisks) {
     // calculate which disk current block (data/parity) should go
@@ -279,6 +287,7 @@ private:
   RAIDLevel gRaidScheme = RAID5;
   bool gEnableHeaderFooter = true;
   bool gEnableRedirection = false;
+  bool gInjectCrash = false;
 
   uint64_t gStorageSpaceInBytes = 1024 * 1024 * 1024 * 1024ull; // 1TiB
 
